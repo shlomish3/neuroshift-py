@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuroshift"
+version = "0.0.1"
+
+[tool.setuptools.packages.find]
+include = ["core", "gui"]     # list every top-level package dir

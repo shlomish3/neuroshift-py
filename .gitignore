@@ -1,0 +1,5 @@
+svc.json
+__pycache__/
+*.py[cod]
+logs/
+output_roster/

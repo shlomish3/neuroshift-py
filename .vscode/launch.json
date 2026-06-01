@@ -1,0 +1,19 @@
+//launch.json
+{
+  "version": "0.2.0",
+  "configurations": [
+    
+    {
+      "name": "Debug NeuroShift (June dry-run)",
+      "type": "python",
+      "request": "launch",
+      "module": "core.assign2",
+      "args": ["2026-06", "--dry-run"],
+
+
+      "console": "integratedTerminal",
+      "justMyCode": false
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
