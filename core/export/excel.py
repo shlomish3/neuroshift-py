@@ -19,6 +19,8 @@ from openpyxl.worksheet.formula import ArrayFormula
 from core.elig_utils import workers_df, unavail_lookup   # auto-build of unassigned lists
 import pandas as pd
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 # ──────────────────────────────────────────────────────────────
 #  Hebrew weekday letters  (Python: Monday=0 … Sunday=6)
 # ──────────────────────────────────────────────────────────────
@@ -47,9 +49,7 @@ _OUT_DIR = Path(
 )
 _OUT_DIR.mkdir(parents=True, exist_ok=True)
 # macro-enabled template
-_XLSM_TEMPLATE = Path(
-    r"C:\Users\shlom\Google Drive\Neurology\Projects\Neuro Shift\סידורי עבודה\neuroshift_template.xlsm"
-)
+_XLSM_TEMPLATE = _PROJECT_ROOT / "templates" / "neuroshift_template.xlsm"
 
 _FIXED_TEMPLATE_SHEETS = {"תורנויות", "עובדים", "ימי שישי", "ייעוצים"}
 
