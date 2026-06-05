@@ -57,18 +57,12 @@ Private Sub ColorBlockDuplicates(ByVal ws As Worksheet, ByVal colIdx As Long, By
         Next t
     Next r
 
-    ' 2) color cells in both ranges that contain any duplicated token (count >= 2)
+    ' 2) color only the duplicated token(s), not the entire cell
     For r = top1 To bot1
-        toks = SplitTokens(CStr(ws.Cells(r, colIdx).Value2))
-        If AnyDupToken(toks, counts) Then
-            ws.Cells(r, colIdx).Font.Color = COLOR_DUP
-        End If
+        ColorDuplicateTokensInCell ws.Cells(r, colIdx), counts
     Next r
     For r = top2 To bot2
-        toks = SplitTokens(CStr(ws.Cells(r, colIdx).Value2))
-        If AnyDupToken(toks, counts) Then
-            ws.Cells(r, colIdx).Font.Color = COLOR_DUP
-        End If
+        ColorDuplicateTokensInCell ws.Cells(r, colIdx), counts
     Next r
 End Sub
 
@@ -94,16 +88,62 @@ Private Sub ResetAllTargetAreas(ByVal ws As Worksheet, ByVal blocks As Variant)
     Next c
 End Sub
 
-Private Function AnyDupToken(ByVal tokens As Variant, ByVal counts As Object) As Boolean
-    Dim t As Variant, k As String
-    For Each t In tokens
-        k = NormalizeKey(CStr(t))
-        If Len(k) > 0 And k <> "-" Then
-            If counts.Exists(k) Then
-                If CLng(counts(k)) >= 2 Then AnyDupToken = True: Exit Function
+Private Sub ColorDuplicateTokensInCell(ByVal target As Range, ByVal counts As Object)
+    Dim txt As String: txt = CStr(target.Value2)
+    If Len(txt) = 0 Then Exit Sub
+
+    target.Font.Color = COLOR_NORM
+
+    Dim raw As Variant: raw = Split(txt, ",")
+    Dim i As Long, partText As String, tokenText As String, key As String
+    Dim partStart As Long, firstOffset As Long, lastOffset As Long
+    Dim charStart As Long, charLen As Long
+
+    partStart = 1
+    For i = LBound(raw) To UBound(raw)
+        partText = CStr(raw(i))
+        tokenText = Application.WorksheetFunction.Trim(Replace(partText, Chr$(160), " "))
+        key = NormalizeKey(tokenText)
+
+        If Len(key) > 0 And key <> "-" Then
+            If counts.Exists(key) And CLng(counts(key)) >= 2 Then
+                firstOffset = FirstNonSpaceOffset(partText)
+                lastOffset = LastNonSpaceOffset(partText)
+
+                If firstOffset > 0 And lastOffset >= firstOffset Then
+                    charStart = partStart + firstOffset - 1
+                    charLen = lastOffset - firstOffset + 1
+
+                    On Error Resume Next
+                    target.Characters(charStart, charLen).Font.Color = COLOR_DUP
+                    On Error GoTo 0
+                End If
             End If
         End If
-    Next t
+        partStart = partStart + Len(partText) + 1   ' +1 for comma
+    Next i
+End Sub
+
+Private Function FirstNonSpaceOffset(ByVal txt As String) As Long
+    Dim i As Long, ch As String
+    For i = 1 To Len(txt)
+        ch = Mid$(txt, i, 1)
+        If ch <> " " And ch <> Chr$(160) And ch <> vbTab Then
+            FirstNonSpaceOffset = i
+            Exit Function
+        End If
+    Next i
+End Function
+
+Private Function LastNonSpaceOffset(ByVal txt As String) As Long
+    Dim i As Long, ch As String
+    For i = Len(txt) To 1 Step -1
+        ch = Mid$(txt, i, 1)
+        If ch <> " " And ch <> Chr$(160) And ch <> vbTab Then
+            LastNonSpaceOffset = i
+            Exit Function
+        End If
+    Next i
 End Function
 
 ' Split by comma, trim spaces, remove NBSPs and empties

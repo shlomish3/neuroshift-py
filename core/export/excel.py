@@ -43,6 +43,15 @@ SHIFT_ORDER: List[str] = [
     "EMG", "EEG", "EEG ילדים", "אחרי תורנות", "חלופי", "חופש", "רוטציה"
 ]
 
+FRIDAY_LINK_SHIFTS: List[str] = [
+    "אטנדינג",
+    "מחלקה",
+    "מיון",
+    "ת.מיון",
+    "ת.מיון 2",
+    "ייעוצים מובילים",
+]
+
 #  default output folder
 _OUT_DIR = Path(
     r"C:\Users\shlom\Google Drive\Neurology\Projects\Neuro Shift\neuroshift-py\output_roster"
@@ -385,6 +394,22 @@ def _ensure_xlsm_name(month: str, fname: str | None) -> str:
         return f"{p.stem}.xlsm"
     return p.name
 
+def _friday_unique_names_formula(source_refs: Sequence[str]) -> str:
+    """
+    Return a live Excel formula that pulls comma-separated names from the
+    month sheet, splits them, removes blanks/dashes, de-duplicates, and joins
+    them with line breaks.
+    """
+    if not source_refs:
+        return '=""'
+    joined_refs = ",".join(source_refs)
+    return (
+        f'=LET(src,TEXTJOIN(",",TRUE,{joined_refs}),'
+        'names,TRIM(TEXTSPLIT(src,",")),'
+        'clean,FILTER(names,(names<>"")*(names<>"-")),'
+        'IFERROR(TEXTJOIN(CHAR(10),TRUE,UNIQUE(clean)),""))'
+    )
+
 def _set_main_month_lookup_formulas(
     ws,
     *,
@@ -703,16 +728,24 @@ def _build_sheet_ovdim(ws):
 
     ws.sheet_view.rightToLeft = True
 
-def _build_sheet_fridays(ws, year: int, mon: int):
+def _build_sheet_fridays(
+    ws,
+    year: int,
+    mon: int,
+    *,
+    friday_refs_by_date: Dict[str, Sequence[str]] | None = None,
+):
     """
     'ימי שישי' sheet:
       - Row 1: empty
       - Row 2: centered headline: 'ימי שישי <HebMonth YY>' (merged A2:E2)
       - Row 3: empty spacer
       - Row 4: header row with Friday dates (DD/MM/YYYY)
-      - Rows 5–9: 5 empty assignment rows
+      - Row 5: live de-duplicated names from selected Friday rows in <YYYY-MM>
+      - Rows 6–9: reserved assignment rows
       - Orange background for the whole table, RTL text, thin grid borders
     """
+    friday_refs_by_date = friday_refs_by_date or {}
     ws.sheet_view.rightToLeft = True
 
     # Headline in row 2 (merged A2:E2 only)
@@ -741,8 +774,19 @@ def _build_sheet_fridays(ws, year: int, mon: int):
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
 
-    # Empty 5 rows underneath
-    for r in range(5, 10):
+    # Linked names row + reserved rows underneath
+    for c, dte in enumerate(fridays, start=1):
+        linked_cell = ws.cell(5, c)
+        linked_cell.value = _friday_unique_names_formula(
+            friday_refs_by_date.get(dte.isoformat(), [])
+        )
+        linked_cell.alignment = Alignment(
+            horizontal="right", vertical="top", wrap_text=True, readingOrder=2
+        )
+
+    ws.row_dimensions[5].height = 95
+
+    for r in range(6, 10):
         for c in range(1, len(fridays) + 1):
             ws.cell(r, c, "").alignment = Alignment(
                 horizontal="right", vertical="top", wrap_text=True, readingOrder=2
@@ -982,11 +1026,16 @@ def export_month_to_xlsx(
     toren_mion_ref_by_date: Dict[str, str] = {}
     toren_machlaka_ref_by_date: Dict[str, str] = {}
     after_cell_pos_by_date: Dict[str, tuple[int, int]] = {}
+    friday_refs_by_date: Dict[str, List[str]] = {}
 
     yoatz_row_off = 2 + SHIFT_ORDER.index("ייעוצים מובילים")
     toren_mion_row_off = 2 + SHIFT_ORDER.index("ת.מיון")
     toren_mach_row_off = 2 + SHIFT_ORDER.index("ת.מיון 2")
     after_row_off = 2 + SHIFT_ORDER.index("אחרי תורנות")
+    friday_row_offsets = {
+        shift: 2 + SHIFT_ORDER.index(shift)
+        for shift in FRIDAY_LINK_SHIFTS
+    }
 
     row_ptr = 1
     for seven in weeks:
@@ -1006,6 +1055,11 @@ def export_month_to_xlsx(
             toren_mion_ref_by_date[d_iso] = f"'{month}'!{col_letter}${tmion_row}"
             toren_machlaka_ref_by_date[d_iso] = f"'{month}'!{col_letter}${tmach_row}"
             after_cell_pos_by_date[d_iso] = (after_row, col)
+            if dte.month == mon and dte.weekday() == 4:
+                friday_refs_by_date[d_iso] = [
+                    f"'{month}'!{col_letter}${block_start + row_off}"
+                    for row_off in friday_row_offsets.values()
+                ]
 
         pivot = _pivot_for_days(
             roster_df,
@@ -1076,7 +1130,7 @@ def export_month_to_xlsx(
     # ----------------------------------------------------------
     _build_sheet_toranut(ws_toranut, yr, mon, roster_df, nights_off_by_date=nights_off_by_date)
     _build_sheet_ovdim(ws_ovdim)
-    _build_sheet_fridays(ws_fridays, yr, mon)
+    _build_sheet_fridays(ws_fridays, yr, mon, friday_refs_by_date=friday_refs_by_date)
     _build_sheet_yoatzim(ws_yoatzim, roster_df, month, main_ref_by_date=yoatz_ref_by_date)
 
     out_path = out_dir / _ensure_xlsm_name(month, fname)
