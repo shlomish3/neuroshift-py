@@ -35,17 +35,31 @@ echo.
 echo Creating roster for %TARGET_MONTH%...
 echo.
 
-where py >nul 2>nul
-if %errorlevel%==0 (
-  py -3 -m core.assign2 "%TARGET_MONTH%"
-) else (
-  python -m core.assign2 "%TARGET_MONTH%"
+set "CONDA_BAT=%USERPROFILE%\miniconda3\Library\bin\conda.bat"
+if not exist "%CONDA_BAT%" (
+  echo Could not find Conda at:
+  echo %CONDA_BAT%
+  echo.
+  echo Please update CONDA_BAT in this file or run from an activated neuroshift environment.
+  pause
+  exit /b 1
 )
 
+call "%CONDA_BAT%" activate neuroshift
+if not %errorlevel%==0 (
+  echo Could not activate the neuroshift Conda environment.
+  pause
+  exit /b 1
+)
+
+python -m core.assign2 "%TARGET_MONTH%"
+set "RUN_EXIT=%errorlevel%"
+
 echo.
-if %errorlevel%==0 (
+if "%RUN_EXIT%"=="0" (
   echo Done. Check the output_roster folder.
 ) else (
   echo The export failed. Review the message above.
 )
 pause
+exit /b %RUN_EXIT%

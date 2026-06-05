@@ -17,7 +17,16 @@ try {
     $excel.DisplayAlerts = $false
 
     $workbook = $excel.Workbooks.Open($template.Path)
-    $components = $workbook.VBProject.VBComponents
+
+    $vbProject = $workbook.VBProject
+    if ($null -eq $vbProject) {
+        throw "Excel did not expose the VBA project. In Excel, enable Trust Center > Macro Settings > Trust access to the VBA project object model, then rerun."
+    }
+
+    $components = $vbProject.VBComponents
+    if ($null -eq $components) {
+        throw "Excel did not expose VBA components. In Excel, enable Trust Center > Macro Settings > Trust access to the VBA project object model, then rerun."
+    }
 
     for ($i = $components.Count; $i -ge 1; $i--) {
         $component = $components.Item($i)
