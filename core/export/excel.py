@@ -394,24 +394,34 @@ def _ensure_xlsm_name(month: str, fname: str | None) -> str:
         return f"{p.stem}.xlsm"
     return p.name
 
-def _friday_unique_names_formula(source_refs: Sequence[str]) -> str:
-    """
-    Return a live Excel formula that pulls comma-separated names from the
-    month sheet, splits them, removes blanks/dashes, de-duplicates, and joins
-    them with line breaks.
-    """
+def _excel_string(text: str) -> str:
+    return '"' + str(text).replace('"', '""') + '"'
+
+def _friday_source_formula(source_refs: Sequence[str]) -> str:
+    """Return a simple formula that normalizes the linked Friday source cells."""
     if not source_refs:
         return '=""'
     joined_refs = ",".join(source_refs)
     return (
-        f'=_xlfn.LET('
-        f'_xlpm.src,_xlfn.TEXTJOIN(",",TRUE,{joined_refs}),'
-        f'_xlpm.names,IFERROR(TRIM(_xlfn.TEXTSPLIT(_xlpm.src,",",,TRUE)),""),'
-        f'_xlpm.clean,_xlfn._xlws.FILTER(_xlpm.names,(_xlpm.names<>"")*(_xlpm.names<>"-")),'
-        f'_xlpm.unique,_xlfn.UNIQUE(_xlpm.clean),'
-        f'IFERROR(_xlfn.TEXTJOIN(CHAR(10),TRUE,_xlpm.unique),"")'
-        f')'
+        f'=IFERROR(","&SUBSTITUTE(TEXTJOIN(",",TRUE,{joined_refs}),", ",",")&",","")'
     )
+
+def _friday_unique_names_formula(source_ref: str, worker_names: Sequence[str]) -> str:
+    """
+    Return an Excel-safe scalar formula: each known worker is checked once
+    against a hidden normalized source string, then joined with line breaks.
+    """
+    parts = []
+    for name in worker_names:
+        clean = str(name).strip()
+        if not clean:
+            continue
+        needle = _excel_string(f",{clean},")
+        shown = _excel_string(clean)
+        parts.append(f'IF(ISNUMBER(SEARCH({needle},{source_ref})),{shown},"")')
+    if not parts:
+        return '=""'
+    return f'=TEXTJOIN(CHAR(10),TRUE,{",".join(parts)})'
 
 def _set_main_month_lookup_formulas(
     ws,
@@ -737,6 +747,7 @@ def _build_sheet_fridays(
     mon: int,
     *,
     friday_refs_by_date: Dict[str, Sequence[str]] | None = None,
+    worker_names: Sequence[str] = (),
 ):
     """
     'ימי שישי' sheet:
@@ -745,6 +756,7 @@ def _build_sheet_fridays(
       - Row 3: empty spacer
       - Row 4: header row with Friday dates (DD/MM/YYYY)
       - Row 5: live de-duplicated names from selected Friday rows in <YYYY-MM>
+      - Row 10: hidden normalized source formulas
       - Rows 6–9: reserved assignment rows
       - Orange background for the whole table, RTL text, thin grid borders
     """
@@ -779,16 +791,19 @@ def _build_sheet_fridays(
 
     # Linked names row + reserved rows underneath
     for c, dte in enumerate(fridays, start=1):
-        linked_cell = ws.cell(5, c)
-        linked_cell.value = ArrayFormula(
-            linked_cell.coordinate,
-            _friday_unique_names_formula(friday_refs_by_date.get(dte.isoformat(), [])),
+        source_cell = ws.cell(10, c)
+        source_cell.value = _friday_source_formula(
+            friday_refs_by_date.get(dte.isoformat(), [])
         )
+
+        linked_cell = ws.cell(5, c)
+        linked_cell.value = _friday_unique_names_formula(source_cell.coordinate, worker_names)
         linked_cell.alignment = Alignment(
             horizontal="right", vertical="top", wrap_text=True, readingOrder=2
         )
 
     ws.row_dimensions[5].height = 95
+    ws.row_dimensions[10].hidden = True
 
     for r in range(6, 10):
         for c in range(1, len(fridays) + 1):
@@ -1134,7 +1149,14 @@ def export_month_to_xlsx(
     # ----------------------------------------------------------
     _build_sheet_toranut(ws_toranut, yr, mon, roster_df, nights_off_by_date=nights_off_by_date)
     _build_sheet_ovdim(ws_ovdim)
-    _build_sheet_fridays(ws_fridays, yr, mon, friday_refs_by_date=friday_refs_by_date)
+    friday_worker_names = workers_df()["שם"].tolist()
+    _build_sheet_fridays(
+        ws_fridays,
+        yr,
+        mon,
+        friday_refs_by_date=friday_refs_by_date,
+        worker_names=friday_worker_names,
+    )
     _build_sheet_yoatzim(ws_yoatzim, roster_df, month, main_ref_by_date=yoatz_ref_by_date)
 
     out_path = out_dir / _ensure_xlsm_name(month, fname)
