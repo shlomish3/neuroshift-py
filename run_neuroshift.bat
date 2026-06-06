@@ -5,14 +5,6 @@ cd /d "%~dp0"
 
 echo Neuro Shift roster export
 echo.
-echo Updating Excel macro template...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\update_template_vba.ps1"
-if not %errorlevel%==0 (
-  echo Warning: could not update the Excel VBA template automatically.
-  echo The export will continue, but duplicate-name coloring may use the old macro.
-  echo.
-)
-
 set /p YEAR=Enter year, for example 2026: 
 set /p MONTH=Enter month number, for example 6 or 06: 
 
@@ -82,8 +74,8 @@ del "%NUMPY_LIST%" "%PANDAS_LIST%" >nul 2>nul
 echo The neuroshift Conda environment has pip-installed numpy/pandas,
 echo which is currently crashing before the roster can run.
 echo.
-echo Please close any Python error popups, then run:
-echo   repair_neuroshift_env.bat
+echo Please close any Python error popups, then ask Codex to repair
+echo the neuroshift environment.
 echo.
 echo After repair finishes, run this file again.
 pause

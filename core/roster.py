@@ -15,6 +15,7 @@ from typing import List, Set, Dict
 import pandas as pd
 
 from core.data import backend_tables
+from core.holiday_utils import effective_weekday_letter, holiday_names_from_tables
 
 
 # ──────────────────────────────────────────────────────────────
@@ -34,6 +35,7 @@ _tables: dict | None = None
 NEEDED_DF: pd.DataFrame | None = None
 SHIFT_TYPES: List[str] = []
 POST_DATES: Set[date] = set()
+HOLIDAY_NAMES: Dict[date, str] = {}
 
 HEB_WEEKDAYS: List[str] = ["ב", "ג", "ד", "ה", "ו", "ש", "א"]   # Mon … Sun
 
@@ -44,7 +46,7 @@ def _ensure_roster_tables_loaded() -> None:
 
     This avoids contacting Google during module import.
     """
-    global _tables, NEEDED_DF, SHIFT_TYPES, POST_DATES
+    global _tables, NEEDED_DF, SHIFT_TYPES, POST_DATES, HOLIDAY_NAMES
 
     if _tables is not None:
         return
@@ -61,6 +63,7 @@ def _ensure_roster_tables_loaded() -> None:
             errors="coerce",
         ).dropna().dt.date
     )
+    HOLIDAY_NAMES = holiday_names_from_tables(_tables)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -96,7 +99,8 @@ def template_for_month(
 
     rows = []
     for d in (first + timedelta(days=i) for i in range((last - first).days + 1)):
-        wd = HEB_WEEKDAYS[d.isoweekday() - 1]  # Hebrew weekday letter
+        display_wd = HEB_WEEKDAYS[d.isoweekday() - 1]  # actual Hebrew weekday letter
+        wd = effective_weekday_letter(d, HOLIDAY_NAMES)
 
         for shift in SHIFT_TYPES:
             # ── 1. base 'Needed' from the required-sheet ───────────────
@@ -109,7 +113,7 @@ def template_for_month(
             # ── 2. base SoftCap ────────────────────────────────────────
             if shift == "מחלקה":
                 # Sun–Thu → allow one extra; Fri/Sat → no extras
-                if d.weekday() in {4, 5}:   # 4=Fri, 5=Sat
+                if wd in {"ו", "ש"}:
                     base_soft_cap = base_needed
                 else:
                     base_soft_cap = base_needed + 1
@@ -129,7 +133,7 @@ def template_for_month(
             rows.append(
                 {
                     "Date": d.isoformat(),
-                    "DayHeb": wd,
+                    "DayHeb": display_wd,
                     "Shift": shift,
                     "Needed": needed,
                     "SoftCap": soft_cap,

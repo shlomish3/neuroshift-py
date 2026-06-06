@@ -13,10 +13,13 @@ from typing import List, Dict, Sequence, Iterable
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.workbook import Workbook
 from openpyxl.worksheet.formula import ArrayFormula
 
 from core.elig_utils import workers_df, unavail_lookup   # auto-build of unassigned lists
+from core.data import backend_tables
+from core.holiday_utils import holiday_names_from_tables
 import pandas as pd
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -57,7 +60,7 @@ _OUT_DIR = Path(
     r"C:\Users\shlom\Google Drive\Neurology\Projects\Neuro Shift\neuroshift-py\output_roster"
 )
 _OUT_DIR.mkdir(parents=True, exist_ok=True)
-# macro-enabled template
+# formatted Excel template
 _XLSM_TEMPLATE = _PROJECT_ROOT / "templates" / "neuroshift_template.xlsm"
 
 _FIXED_TEMPLATE_SHEETS = {"תורנויות", "עובדים", "ימי שישי", "ייעוצים"}
@@ -66,6 +69,16 @@ _FIXED_TEMPLATE_SHEETS = {"תורנויות", "עובדים", "ימי שישי",
 _ORANGE = PatternFill("solid", fgColor="FFD99B")  # Fri/Sat
 _GREY   = PatternFill("solid", fgColor="E6E6E6")  # out-of-month
 _BLUE   = PatternFill("solid", fgColor="CDEBF7")  # holidays / erev-chag (ייעוצים sheet)
+_DUP_RED_FILL = PatternFill("solid", fgColor="FFC7CE")
+_DUP_RED_FONT = Font(color="9C0006")
+
+TORANUT_SENIORS: List[str] = [
+    "ברטל", "גנדלמן", "כהן", "פרץ", "קימיאגר", "קינן", "הרש", "שמעון",
+]
+TORANUT_RESIDENTS: List[str] = [
+    "ברג", "גלינסקיה", "דקל", "הסר", "לקן", "עסלי", "פריאנטה",
+    "שמואל", "חדיג'ה", "ארדשירוב", "סעוב",
+]
 
 # ──────────────────────────────────────────────────────────────
 #  helpers
@@ -135,6 +148,19 @@ def _merge_names(existing: str, extra: Sequence[str]) -> str:
     cur.update(n for n in extra if n.strip())
     return ", ".join(sorted(cur)) if cur else "-"
 
+def _holiday_label(d: date, holiday_names: Dict[date, str]) -> str:
+    if d in holiday_names:
+        return holiday_names[d]
+    next_name = holiday_names.get(d + timedelta(days=1))
+    if next_name:
+        return f"ערב {next_name}"
+    return ""
+
+def _weekday_header(d: date, holiday_names: Dict[date, str]) -> str:
+    label = _holiday_label(d, holiday_names)
+    weekday = _WEEKDAY_LETTERS[d.weekday()]
+    return f"{weekday}\n{label}" if label else weekday
+
 def _pivot_for_days(
     roster: pd.DataFrame,
     seven_iso: Sequence[str],
@@ -187,14 +213,16 @@ def _fmt_unassigned(lst: Sequence[str | tuple[str, str]]) -> str:
 def _build_calendar_df(
     pivot: pd.DataFrame,
     seven_dates: List[date],
-    unassigned: Dict[str, Sequence[str | tuple[str, str]]] | None = None
+    unassigned: Dict[str, Sequence[str | tuple[str, str]]] | None = None,
+    holiday_names: Dict[date, str] | None = None,
 ) -> pd.DataFrame:
     """Return DF = 2-row header + body + optional ‘un-assigned’ row."""
+    holiday_names = holiday_names or {}
     date_cols = [d.strftime("%d/%m/%Y") for d in seven_dates]
     cols      = ["תפקיד"] + date_cols
 
     # Weekday first (bolded top row) then date row
-    hdr1 = [""] + [_WEEKDAY_LETTERS[d.weekday()] for d in seven_dates]
+    hdr1 = [""] + [_weekday_header(d, holiday_names) for d in seven_dates]
     hdr2 = ["תפקיד"] + date_cols
 
     header = pd.DataFrame([hdr1, hdr2], columns=cols)
@@ -212,7 +240,8 @@ def _style_block(
     n_rows: int,
     n_cols: int,
     highlight_cols: Sequence[int],
-    grey_cols: Sequence[int] = ()
+    grey_cols: Sequence[int] = (),
+    holiday_cols: Sequence[int] = (),
 ) -> None:
     """
     Apply:
@@ -253,6 +282,8 @@ def _style_block(
             # fills (gray wins over orange)
             if c in grey_cols:
                 cell.fill = _GREY
+            elif c in holiday_cols:
+                cell.fill = _BLUE
             elif c in highlight_cols:
                 cell.fill = _ORANGE
 
@@ -261,9 +292,11 @@ def _write_block(
     start_row: int,
     df_block: pd.DataFrame,
     seven_dates: List[date],
-    grey_cols: Sequence[int] = ()
+    grey_cols: Sequence[int] = (),
+    holiday_names: Dict[date, str] | None = None,
 ) -> int:
     """Write *df_block* (top-left at A<start_row>) – return next free row."""
+    holiday_names = holiday_names or {}
     n_rows, n_cols = df_block.shape
 
     # write values
@@ -275,12 +308,18 @@ def _write_block(
     highlight = [
         1 + i
         for i, d in enumerate(seven_dates, start=1)
-        if d.weekday() in (4, 5)  # Fri=4, Sat=5
+        if d.weekday() in (4, 5) or (d + timedelta(days=1)) in holiday_names
+    ]
+    holiday_cols = [
+        1 + i
+        for i, d in enumerate(seven_dates, start=1)
+        if d in holiday_names
     ]
 
     _style_block(ws, start_row, 1, n_rows, n_cols,
                  highlight_cols=highlight,
-                 grey_cols=grey_cols)
+                 grey_cols=grey_cols,
+                 holiday_cols=holiday_cols)
     return start_row + n_rows
 
 # ----------  Extra sheet builders  ----------------------------
@@ -292,7 +331,7 @@ def _new_sheet(wb: Workbook, title: str):
 def _find_template_month_sheet(wb: Workbook):
     """
     Return the single non-fixed sheet in the template.
-    This is the VBA-bearing main month sheet that must be reused, not deleted.
+    This is the template month sheet that must be reused, not deleted.
     """
     candidates = [ws for ws in wb.worksheets if ws.title not in _FIXED_TEMPLATE_SHEETS]
     if len(candidates) != 1:
@@ -312,7 +351,7 @@ def _clear_range(
 ) -> None:
     """
     Clear cell values/comments/hyperlinks in a rectangular range.
-    Keeps the worksheet object itself intact, which is critical for worksheet VBA code.
+    Keeps the worksheet object itself intact, preserving template formatting/settings.
     """
     max_row = max_row or ws.max_row
     max_col = max_col or ws.max_column
@@ -352,11 +391,14 @@ def _prepare_toranut_sheet(ws) -> None:
     """
     Clear only the areas owned by the Python exporter:
     - main toranut table in B:F
+    - available-worker/formula area in H:I
     - helper night-unavailability column in R
     Preserve the counting/formula area in between.
     """
     _clear_range(ws, 1, 2, ws.max_row, 6, clear_merges=True)  # B:F
+    _clear_range(ws, 1, 8, ws.max_row, 9, clear_merges=True)  # H:I
     _clear_range(ws, 1, 18, ws.max_row, 18, clear_merges=False)  # R:R
+    _clear_range(ws, 1, 24, ws.max_row, 24, clear_merges=False)  # X:X hidden helpers
     ws.sheet_view.rightToLeft = True
     ws.freeze_panes = None
 
@@ -378,7 +420,7 @@ def _prepare_yoatzim_sheet(ws) -> None:
 def _save_workbook_atomic(wb: Workbook, out_path: Path) -> None:
     """
     Save to a temporary file first, then replace the final file.
-    This reduces the chance of ending up with a corrupted .xlsm if saving fails midway.
+    This reduces the chance of ending up with a corrupted workbook if saving fails midway.
     """
     tmp_path = out_path.with_name(f"{out_path.stem}.__tmp__{out_path.suffix}")
     if tmp_path.exists():
@@ -386,42 +428,110 @@ def _save_workbook_atomic(wb: Workbook, out_path: Path) -> None:
     wb.save(tmp_path)
     tmp_path.replace(out_path)
 
-def _ensure_xlsm_name(month: str, fname: str | None) -> str:
+def _ensure_xlsx_name(month: str, fname: str | None) -> str:
     if fname is None:
-        return f"roster_{month}.xlsm"
+        return f"roster_{month}.xlsx"
     p = Path(fname)
-    if p.suffix.lower() != ".xlsm":
-        return f"{p.stem}.xlsm"
+    if p.suffix.lower() != ".xlsx":
+        return f"{p.stem}.xlsx"
     return p.name
 
-def _excel_string(text: str) -> str:
-    return '"' + str(text).replace('"', '""') + '"'
+_FRIDAY_TOKEN_WIDTH = 99
+_FRIDAY_MAX_NAMES_PER_SOURCE = 4
+_FRIDAY_VISIBLE_NAME_ROWS = 6
 
-def _friday_source_formula(source_refs: Sequence[str]) -> str:
-    """Return a simple formula that normalizes the linked Friday source cells."""
-    if not source_refs:
-        return '=""'
-    joined_refs = ",".join(source_refs)
+def _friday_name_token_expr(source_ref: str, token_index: int) -> str:
+    """Return an old-Excel-compatible formula fragment for one comma-separated name."""
+    start = 1 + (token_index * _FRIDAY_TOKEN_WIDTH)
     return (
-        f'=IFERROR(","&SUBSTITUTE(TEXTJOIN(",",TRUE,{joined_refs}),", ",",")&",","")'
+        f'TRIM(MID(SUBSTITUTE({source_ref},",",'
+        f'REPT(" ",{_FRIDAY_TOKEN_WIDTH})),{start},{_FRIDAY_TOKEN_WIDTH}))'
     )
 
-def _friday_unique_names_formula(source_ref: str, worker_names: Sequence[str]) -> str:
+def _friday_link_formula(
+    source_ref: str,
+    token_index: int,
+    col_letter: str,
+    row_num: int,
+    dedupe_start_row: int,
+) -> str:
     """
-    Return an Excel-safe scalar formula: each known worker is checked once
-    against a hidden normalized source string, then joined with line breaks.
+    Link one visible Friday-sheet cell to one name token in the month sheet.
+    Duplicate names already shown above in the same Friday column are suppressed.
     """
-    parts = []
-    for name in worker_names:
-        clean = str(name).strip()
-        if not clean:
+    token = _friday_name_token_expr(source_ref, token_index)
+    blank_or_dash = f'OR({token}="",{token}="-")'
+    if row_num <= dedupe_start_row:
+        return f'=IFERROR(IF({blank_or_dash},"",{token}),"")'
+
+    previous_names = f"{col_letter}${dedupe_start_row}:{col_letter}{row_num - 1}"
+    return (
+        f'=IFERROR(IF({blank_or_dash},"",'
+        f'IF(COUNTIF({previous_names},{token})=0,{token},"")),"")'
+    )
+
+def _friday_visible_name_formula(
+    col_letter: str,
+    helper_start_row: int,
+    helper_end_row: int,
+    visible_index: int,
+) -> str:
+    helper_range = f"{col_letter}${helper_start_row}:{col_letter}${helper_end_row}"
+    first_helper = f"{col_letter}${helper_start_row}"
+    return (
+        f'=IFERROR(INDEX({helper_range},'
+        f'AGGREGATE(15,6,(ROW({helper_range})-ROW({first_helper})+1)/({helper_range}<>""),'
+        f'{visible_index})),"")'
+    )
+
+def _duplicate_name_formula(
+    cell_ref: str,
+    column_range: str,
+    *,
+    max_tokens: int = 6,
+) -> str:
+    """
+    Conditional-formatting formula for a comma-separated name cell.
+    It turns true when any token in the current cell appears in another
+    assignment cell in the same date column.
+    """
+    normalized_column = f'SUBSTITUTE(TEXTJOIN(",",TRUE,{column_range}),", ",",")'
+    checks = []
+    for token_index in range(max_tokens):
+        token = _friday_name_token_expr(cell_ref, token_index)
+        checks.append(
+            f'AND({token}<>"",'
+            f'SUMPRODUCT(--ISNUMBER(SEARCH(","&{token}&",",","&{normalized_column}&",")))>1)'
+        )
+    return f"OR({','.join(checks)})"
+
+def _add_duplicate_name_conditional_formatting(
+    ws,
+    *,
+    block_start: int,
+    seven_dates: Sequence[date],
+    mon: int,
+) -> None:
+    first_body_row = block_start + 2
+    last_body_row = first_body_row + len(SHIFT_ORDER) - 1
+
+    for i, dte in enumerate(seven_dates):
+        if dte.month != mon:
             continue
-        needle = _excel_string(f",{clean},")
-        shown = _excel_string(clean)
-        parts.append(f'IF(ISNUMBER(SEARCH({needle},{source_ref})),{shown},"")')
-    if not parts:
-        return '=""'
-    return f'=TEXTJOIN(CHAR(10),TRUE,{",".join(parts)})'
+
+        col = 2 + i  # B..H
+        col_letter = get_column_letter(col)
+        column_range = f"{col_letter}${first_body_row}:{col_letter}${last_body_row}"
+        cf_range = f"{col_letter}{first_body_row}:{col_letter}{last_body_row}"
+        formula = _duplicate_name_formula(
+            f"{col_letter}{first_body_row}",
+            column_range,
+        )
+
+        ws.conditional_formatting.add(
+            cf_range,
+            FormulaRule(formula=[formula], fill=_DUP_RED_FILL, font=_DUP_RED_FONT),
+        )
 
 def _set_main_month_lookup_formulas(
     ws,
@@ -461,11 +571,13 @@ def _set_unassigned_formula_row(
     block_start: int,
     seven_dates: Sequence[date],
     mon: int,
+    holiday_names: Dict[date, str] | None = None,
 ) -> None:
     """
     Write the Excel formula row for '⚠️ לא שובצו' under one weekly block.
     """
     row_num = block_start + 2 + len(SHIFT_ORDER)
+    holiday_names = holiday_names or {}
 
     thin = Side(style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -522,8 +634,51 @@ def _set_unassigned_formula_row(
 
         if d.month != mon:
             cell.fill = _GREY
+        elif d in holiday_names:
+            cell.fill = _BLUE
         elif d.weekday() in (4, 5):
             cell.fill = _ORANGE
+        elif d + timedelta(days=1) in holiday_names:
+            cell.fill = _ORANGE
+
+def _build_toranut_summary_table(ws) -> None:
+    blue = PatternFill("solid", fgColor="CDEBF7")
+    green = PatternFill("solid", fgColor="C6EFCE")
+    header_fill = PatternFill("solid", fgColor="D9EAD3")
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    ws.column_dimensions["I"].width = 22
+    ws.cell(3, 9, "תמונת מצב").font = Font(bold=True)
+    ws.cell(3, 9).fill = header_fill
+    ws.cell(3, 9).alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
+    ws.cell(3, 9).border = border
+
+    row = 4
+    ws.cell(row, 9, "בכירים").font = Font(bold=True)
+    ws.cell(row, 9).fill = blue
+    ws.cell(row, 9).alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
+    ws.cell(row, 9).border = border
+    row += 1
+    for name in TORANUT_SENIORS:
+        cell = ws.cell(row, 9, name)
+        cell.fill = blue
+        cell.alignment = Alignment(horizontal="right", vertical="center", readingOrder=2)
+        cell.border = border
+        row += 1
+
+    row += 1
+    ws.cell(row, 9, "מתמחים").font = Font(bold=True)
+    ws.cell(row, 9).fill = green
+    ws.cell(row, 9).alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
+    ws.cell(row, 9).border = border
+    row += 1
+    for name in TORANUT_RESIDENTS:
+        cell = ws.cell(row, 9, name)
+        cell.fill = green
+        cell.alignment = Alignment(horizontal="right", vertical="center", readingOrder=2)
+        cell.border = border
+        row += 1
 
 def _build_sheet_toranut(
     ws,
@@ -531,6 +686,7 @@ def _build_sheet_toranut(
     mon: int,
     roster_df: pd.DataFrame,
     holidays: Sequence[date] = (),
+    holidays_named: Dict[date, str] | None = None,
     nights_off_by_date: Dict[str, Sequence[str]] | None = None,
 ):
     """
@@ -571,6 +727,23 @@ def _build_sheet_toranut(
     cell_h.alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
     ws.column_dimensions["H"].width = 30
 
+    _build_toranut_summary_table(ws)
+
+    # Column X is a hidden generated helper list for column H formulas.
+    # Column I is reserved for the senior/resident overview table.
+    helper_col = 24
+    helper_start_row = 4
+    worker_names = TORANUT_SENIORS + TORANUT_RESIDENTS
+    ws.cell(3, helper_col, "workers helper")
+    for idx, name in enumerate(worker_names, start=helper_start_row):
+        ws.cell(idx, helper_col, name)
+    ws.column_dimensions[get_column_letter(helper_col)].hidden = True
+    helper_end_row = helper_start_row + max(len(worker_names), 1) - 1
+    worker_list = (
+        f"${get_column_letter(helper_col)}${helper_start_row}:"
+        f"${get_column_letter(helper_col)}${helper_end_row}"
+    )
+
     # Build lookup from roster_df
     month_prefix = f"{year:04d}-{mon:02d}"
     subset = roster_df[roster_df["Date"].str.startswith(month_prefix)].copy()
@@ -581,13 +754,16 @@ def _build_sheet_toranut(
         if shift not in {"ת.מיון", "ת.מיון 2", "כונן מיון"}:
             continue
         d_iso = str(row["Date"])
-        names = ", ".join(_names(str(row["Assigned"]))) or "-"
+        names_list = list(_names(str(row["Assigned"])))
+        names = ", ".join(names_list) or "-"
         assigned_by_date_shift[(d_iso, shift)] = names
 
     ORANGE = PatternFill("solid", fgColor="FFD99B")   # Fri / erev hag
-    YELLOW = PatternFill("solid", fgColor="FFF299")   # Sat / holiday
+    YELLOW = PatternFill("solid", fgColor="FFF299")   # Sat
     thin = Side(style="thin", color="000000")
     thick = Side(style="medium", color="000000")
+    holidays = set(holidays)
+    holidays_named = holidays_named or {}
 
     first = date(year, mon, 1)
     cur = first
@@ -596,7 +772,12 @@ def _build_sheet_toranut(
         d_iso = cur.isoformat()
 
         ws.cell(row_ptr, 2, cur.strftime("%d/%m/%Y"))                               # B תאריך
-        ws.cell(row_ptr, 3, _WEEKDAY_LETTERS[cur.weekday()])                        # C יום
+        day_label = _WEEKDAY_LETTERS[cur.weekday()]
+        holiday_label = _holiday_label(cur, holidays_named)
+        if holiday_label:
+            day_label = f"{day_label} - {holiday_label}"
+
+        ws.cell(row_ptr, 3, day_label)                                              # C יום
         ws.cell(row_ptr, 4, assigned_by_date_shift.get((d_iso, "ת.מיון"), ""))  # D
         ws.cell(row_ptr, 5, assigned_by_date_shift.get((d_iso, "ת.מיון 2"), "")) # E
         ws.cell(row_ptr, 6, assigned_by_date_shift.get((d_iso, "כונן מיון"), ""))  # F
@@ -604,9 +785,6 @@ def _build_sheet_toranut(
         night_blocked = ", ".join(nights_off_by_date.get(d_iso, [])) if nights_off_by_date else ""
         ws.cell(row_ptr, 18, night_blocked)                                         # R
 
-        # --- NEW LOGIC FOR COLUMN H ---
-        worker_list = "$I$13:$I$23"
-        
         if row_ptr == 4:
             search_target = f'D{row_ptr} & " " & E{row_ptr} & " " & R{row_ptr}'
         else:
@@ -636,9 +814,11 @@ def _build_sheet_toranut(
                 d = None
 
             if d:
-                if d.weekday() == 4 or (d - timedelta(days=1)) in holidays:
+                if d in holidays:
+                    cell.fill = _BLUE
+                elif d.weekday() == 4 or (d + timedelta(days=1)) in holidays:
                     cell.fill = ORANGE
-                elif d.weekday() == 5 or d in holidays:
+                elif d.weekday() == 5:
                     cell.fill = YELLOW
 
             left = thick if c in (start_col, 8) else thin
@@ -672,9 +852,11 @@ def _build_sheet_toranut(
             d = None
 
         if d:
-            if d.weekday() == 4 or (d - timedelta(days=1)) in holidays:
+            if d in holidays:
+                cell.fill = _BLUE
+            elif d.weekday() == 4 or (d + timedelta(days=1)) in holidays:
                 cell.fill = ORANGE
-            elif d.weekday() == 5 or d in holidays:
+            elif d.weekday() == 5:
                 cell.fill = YELLOW
 
         cell.border = Border(
@@ -747,7 +929,6 @@ def _build_sheet_fridays(
     mon: int,
     *,
     friday_refs_by_date: Dict[str, Sequence[str]] | None = None,
-    worker_names: Sequence[str] = (),
 ):
     """
     'ימי שישי' sheet:
@@ -755,9 +936,8 @@ def _build_sheet_fridays(
       - Row 2: centered headline: 'ימי שישי <HebMonth YY>' (merged A2:E2)
       - Row 3: empty spacer
       - Row 4: header row with Friday dates (DD/MM/YYYY)
-      - Row 5: live de-duplicated names from selected Friday rows in <YYYY-MM>
-      - Row 10: hidden normalized source formulas
-      - Rows 6–9: reserved assignment rows
+      - Rows 5-10: first six live linked names from selected Friday rows in <YYYY-MM>
+        one name per cell, with repeats hidden inside each Friday column
       - Orange background for the whole table, RTL text, thin grid borders
     """
     friday_refs_by_date = friday_refs_by_date or {}
@@ -789,32 +969,63 @@ def _build_sheet_fridays(
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
 
-    # Linked names row + reserved rows underneath
+    visible_start_row = 5
+    visible_end_row = visible_start_row + _FRIDAY_VISIBLE_NAME_ROWS - 1
+    helper_start_row = visible_end_row + 1
+    rows_per_friday = len(FRIDAY_LINK_SHIFTS) * _FRIDAY_MAX_NAMES_PER_SOURCE
+    helper_end_row = helper_start_row + rows_per_friday - 1
+
+    # Hidden helper rows split source cells into one de-duplicated name per row.
     for c, dte in enumerate(fridays, start=1):
-        source_cell = ws.cell(10, c)
-        source_cell.value = _friday_source_formula(
-            friday_refs_by_date.get(dte.isoformat(), [])
-        )
+        col_letter = get_column_letter(c)
+        row_num = helper_start_row
+        refs = friday_refs_by_date.get(dte.isoformat(), [])
 
-        linked_cell = ws.cell(5, c)
-        linked_cell.value = _friday_unique_names_formula(source_cell.coordinate, worker_names)
-        linked_cell.alignment = Alignment(
-            horizontal="right", vertical="top", wrap_text=True, readingOrder=2
-        )
+        for source_ref in refs:
+            for token_index in range(_FRIDAY_MAX_NAMES_PER_SOURCE):
+                cell = ws.cell(row_num, c)
+                cell.value = _friday_link_formula(
+                    source_ref,
+                    token_index,
+                    col_letter,
+                    row_num,
+                    helper_start_row,
+                )
+                cell.alignment = Alignment(
+                    horizontal="right", vertical="top", wrap_text=True, readingOrder=2
+                )
+                row_num += 1
 
-    ws.row_dimensions[5].height = 95
-    ws.row_dimensions[10].hidden = True
-
-    for r in range(6, 10):
-        for c in range(1, len(fridays) + 1):
-            ws.cell(r, c, "").alignment = Alignment(
+        while row_num <= helper_end_row:
+            cell = ws.cell(row_num, c, "")
+            cell.alignment = Alignment(
                 horizontal="right", vertical="top", wrap_text=True, readingOrder=2
             )
+            row_num += 1
+
+        for r in range(visible_start_row, visible_end_row + 1):
+            cell = ws.cell(r, c)
+            formula = _friday_visible_name_formula(
+                col_letter,
+                helper_start_row,
+                helper_end_row,
+                r - visible_start_row + 1,
+            )
+            cell.value = ArrayFormula(f"{col_letter}{r}", formula)
+            cell.alignment = Alignment(
+                horizontal="right", vertical="top", wrap_text=True, readingOrder=2
+            )
+
+    for r in range(visible_start_row, visible_end_row + 1):
+        ws.row_dimensions[r].height = 22
+
+    for r in range(helper_start_row, helper_end_row + 1):
+        ws.row_dimensions[r].hidden = True
 
     # Orange fill and borders for table
     thin = Side(style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for r in range(4, 10):
+    for r in range(4, visible_end_row + 1):
         for c in range(1, len(fridays) + 1):
             cell = ws.cell(r, c)
             cell.fill = _ORANGE
@@ -887,7 +1098,7 @@ def _build_sheet_yoatzim(
         label = ""
         if d in holidays_set:
             label = f" ({name_map.get(d, 'חג')})"
-        elif (d - timedelta(days=1)) in holidays_set:
+        elif (d + timedelta(days=1)) in holidays_set:
             label = " (ערב חג)"
         day_text = f"{weekday_full}{label}"
 
@@ -912,8 +1123,10 @@ def _build_sheet_yoatzim(
             )
 
         # צבעים: כחול גובר על כתום
-        if d in holidays_set or (d - timedelta(days=1)) in holidays_set:
+        if d in holidays_set:
             fill = _BLUE
+        elif (d + timedelta(days=1)) in holidays_set:
+            fill = _ORANGE
         elif d.weekday() in (4, 5):  # Fri/Sat
             fill = _ORANGE
         else:
@@ -979,8 +1192,8 @@ def export_month_to_xlsx(
     template_path: str | Path = _XLSM_TEMPLATE,
 ) -> Path:
     """
-    Export a macro-enabled workbook (.xlsm) by loading a VBA template and
-    overwriting the relevant sheet contents while preserving existing VBA.
+    Export a macro-free workbook (.xlsx) by loading the formatted template and
+    overwriting the relevant sheet contents.
 
     Sheets:
       1) <YYYY-MM> — full month calendar (stacked weeks)
@@ -1001,6 +1214,8 @@ def export_month_to_xlsx(
     if days_off_by_date is None:
         days_off_by_date = _auto_days_off()
     nights_off_by_date = _auto_nights_off()
+    holiday_names = holiday_names_from_tables(backend_tables())
+    holidays = set(holiday_names)
 
     yr, mon = map(int, month.split("-"))
     first = date(yr, mon, 1)
@@ -1013,14 +1228,15 @@ def export_month_to_xlsx(
         cur += timedelta(days=7)
 
     # ----------------------------------------------------------
-    # Load VBA container template
+    # Load the formatted template without preserving VBA.
+    # Keeping macros/event handlers clears Excel's Undo stack on open/edit.
     # ----------------------------------------------------------
-    wb = load_workbook(template_path, keep_vba=True)
+    wb = load_workbook(template_path, keep_vba=False)
     wb.calculation.calcMode = "auto"
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
 
-    # Reuse the existing template month sheet object to preserve worksheet VBA
+    # Reuse the existing template month sheet object to preserve formatting/settings
     ws = _find_template_month_sheet(wb)
     if ws.title != month:
         ws.title = month
@@ -1087,11 +1303,18 @@ def export_month_to_xlsx(
             days_off_by_date=days_off_by_date,
         )
 
-        block_df = _build_calendar_df(pivot, seven)
+        block_df = _build_calendar_df(pivot, seven, holiday_names=holiday_names)
 
         grey_cols = [1 + i for i, d in enumerate(seven, start=1) if d.month != mon]
 
-        row_ptr = _write_block(ws, row_ptr, block_df, seven, grey_cols=grey_cols)
+        row_ptr = _write_block(
+            ws,
+            row_ptr,
+            block_df,
+            seven,
+            grey_cols=grey_cols,
+            holiday_names=holiday_names,
+        )
 
         # Reinsert the Excel formula row for 'לא שובצו'
         _set_unassigned_formula_row(
@@ -1103,6 +1326,12 @@ def export_month_to_xlsx(
 
         # Rebuild lookup formulas on the main month sheet after the block was written
         _set_main_month_lookup_formulas(ws, block_start=block_start, seven_dates=seven)
+        _add_duplicate_name_conditional_formatting(
+            ws,
+            block_start=block_start,
+            seven_dates=seven,
+            mon=mon,
+        )
 
         row_ptr += 2  # one for 'לא שובצו' row, one spacer
 
@@ -1147,19 +1376,32 @@ def export_month_to_xlsx(
     # ----------------------------------------------------------
     # Rebuild the fixed sheets in-place
     # ----------------------------------------------------------
-    _build_sheet_toranut(ws_toranut, yr, mon, roster_df, nights_off_by_date=nights_off_by_date)
+    _build_sheet_toranut(
+        ws_toranut,
+        yr,
+        mon,
+        roster_df,
+        holidays=holidays,
+        holidays_named=holiday_names,
+        nights_off_by_date=nights_off_by_date,
+    )
     _build_sheet_ovdim(ws_ovdim)
-    friday_worker_names = workers_df()["שם"].tolist()
     _build_sheet_fridays(
         ws_fridays,
         yr,
         mon,
         friday_refs_by_date=friday_refs_by_date,
-        worker_names=friday_worker_names,
     )
-    _build_sheet_yoatzim(ws_yoatzim, roster_df, month, main_ref_by_date=yoatz_ref_by_date)
+    _build_sheet_yoatzim(
+        ws_yoatzim,
+        roster_df,
+        month,
+        holidays=holidays,
+        holidays_named=holiday_names,
+        main_ref_by_date=yoatz_ref_by_date,
+    )
 
-    out_path = out_dir / _ensure_xlsm_name(month, fname)
+    out_path = out_dir / _ensure_xlsx_name(month, fname)
     _save_workbook_atomic(wb, out_path)
     return out_path
 

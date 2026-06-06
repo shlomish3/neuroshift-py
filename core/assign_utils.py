@@ -25,6 +25,7 @@ from core.constants import(
     RECENCY_WINDOW_DAYS, RECENCY_PENALTY_MAX, PENALTY_REDUCER,
     )
 from core.eligibility2 import unavail_lookup, BLOCKS_ALL
+from core.holiday_utils import effective_weekday_letter, holiday_names_from_tables
 import logging
 from pathlib import Path
 from itertools import chain
@@ -165,8 +166,8 @@ def fixed_lookup(month: str, tables: dict) -> Dict[Tuple[date, str], List[str]]:
     """
     Build a {(date, shift_type): [names…]} map for *month*.
 
-    • **Night shifts** (ת.מיון / ת.מיון 2 / כונן מיון) are kept even on
-      Fridays, Saturdays and days tagged *חופש*.
+    • **Night shifts** (ת.מיון / ת.מיון 2 / כונן מיון) are kept and override
+      auto-assignment if present in שיבוצים קבועים.
     • All other shift types are still limited to Sun-Thu | non-holiday days.
     """
     fx = tables["fixed_assign"].copy()
@@ -193,14 +194,7 @@ def fixed_lookup(month: str, tables: dict) -> Dict[Tuple[date, str], List[str]]:
     last_day  = (first_day.replace(day=28) + timedelta(days=4)).replace(day=1) \
                 - timedelta(days=1)
 
-    # ── holidays tagged 'חופש' ────────────────────────────────
-    hol_df = tables["holidays"]
-    rest_days = set(
-        pd.to_datetime(
-            hol_df.loc[hol_df["סוג"] == "חופש", "תאריך"],
-            format="mixed", dayfirst=True, errors="coerce"
-        ).dropna().dt.date
-    )
+    holiday_names = holiday_names_from_tables(tables)
 
     # ── expand spans → dict ───────────────────────────────────
     out: Dict[Tuple[date, str], List[str]] = {}
@@ -210,12 +204,14 @@ def fixed_lookup(month: str, tables: dict) -> Dict[Tuple[date, str], List[str]]:
         if span_start > span_end:
             continue
 
-        is_night_shift = row[COL_SHIFT] in NIGHT_DUTY_SHIFTS
         d = span_start
         while d <= span_end:
-            #  allow all dates for night duties;
-            #  for other shifts keep Sun-Thu & non-holiday only
-            if is_night_shift or (d.weekday() not in (4, 5) and d not in rest_days):
+            is_night_shift = row[COL_SHIFT] in NIGHT_DUTY_SHIFTS
+            effective_wd = effective_weekday_letter(d, holiday_names)
+
+            # Night duties can be fixed on every date.
+            # Other fixed shifts stay limited to normal Sun-Thu workdays.
+            if is_night_shift or effective_wd not in {"ו", "ש"}:
                 key = (d, row[COL_SHIFT])
                 out.setdefault(key, []).append(row[COL_NAME])
             d += timedelta(days=1)
