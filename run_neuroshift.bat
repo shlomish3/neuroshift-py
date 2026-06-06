@@ -45,6 +45,19 @@ if not exist "%CONDA_BAT%" (
   exit /b 1
 )
 
+set "NUMPY_LIST=%TEMP%\neuroshift_numpy_list.txt"
+set "PANDAS_LIST=%TEMP%\neuroshift_pandas_list.txt"
+
+call "%CONDA_BAT%" list -n neuroshift numpy > "%NUMPY_LIST%" 2>nul
+findstr /R /C:"^numpy .*pypi" "%NUMPY_LIST%" >nul
+if %errorlevel%==0 goto broken_python_env
+
+call "%CONDA_BAT%" list -n neuroshift pandas > "%PANDAS_LIST%" 2>nul
+findstr /R /C:"^pandas .*pypi" "%PANDAS_LIST%" >nul
+if %errorlevel%==0 goto broken_python_env
+
+del "%NUMPY_LIST%" "%PANDAS_LIST%" >nul 2>nul
+
 call "%CONDA_BAT%" activate neuroshift
 if not %errorlevel%==0 (
   echo Could not activate the neuroshift Conda environment.
@@ -63,3 +76,15 @@ if "%RUN_EXIT%"=="0" (
 )
 pause
 exit /b %RUN_EXIT%
+
+:broken_python_env
+del "%NUMPY_LIST%" "%PANDAS_LIST%" >nul 2>nul
+echo The neuroshift Conda environment has pip-installed numpy/pandas,
+echo which is currently crashing before the roster can run.
+echo.
+echo Please close any Python error popups, then run:
+echo   repair_neuroshift_env.bat
+echo.
+echo After repair finishes, run this file again.
+pause
+exit /b 1

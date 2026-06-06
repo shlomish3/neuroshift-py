@@ -404,10 +404,13 @@ def _friday_unique_names_formula(source_refs: Sequence[str]) -> str:
         return '=""'
     joined_refs = ",".join(source_refs)
     return (
-        f'=LET(src,TEXTJOIN(",",TRUE,{joined_refs}),'
-        'names,TRIM(TEXTSPLIT(src,",")),'
-        'clean,FILTER(names,(names<>"")*(names<>"-")),'
-        'IFERROR(TEXTJOIN(CHAR(10),TRUE,UNIQUE(clean)),""))'
+        f'=_xlfn.LET('
+        f'_xlpm.src,_xlfn.TEXTJOIN(",",TRUE,{joined_refs}),'
+        f'_xlpm.names,IFERROR(TRIM(_xlfn.TEXTSPLIT(_xlpm.src,",",,TRUE)),""),'
+        f'_xlpm.clean,_xlfn._xlws.FILTER(_xlpm.names,(_xlpm.names<>"")*(_xlpm.names<>"-")),'
+        f'_xlpm.unique,_xlfn.UNIQUE(_xlpm.clean),'
+        f'IFERROR(_xlfn.TEXTJOIN(CHAR(10),TRUE,_xlpm.unique),"")'
+        f')'
     )
 
 def _set_main_month_lookup_formulas(
@@ -777,8 +780,9 @@ def _build_sheet_fridays(
     # Linked names row + reserved rows underneath
     for c, dte in enumerate(fridays, start=1):
         linked_cell = ws.cell(5, c)
-        linked_cell.value = _friday_unique_names_formula(
-            friday_refs_by_date.get(dte.isoformat(), [])
+        linked_cell.value = ArrayFormula(
+            linked_cell.coordinate,
+            _friday_unique_names_formula(friday_refs_by_date.get(dte.isoformat(), [])),
         )
         linked_cell.alignment = Alignment(
             horizontal="right", vertical="top", wrap_text=True, readingOrder=2
