@@ -115,11 +115,13 @@ def get_eligible_workers(
         if reason:
             note(n, reason);  continue
 
-        # clinics tomorrow block tonight's night duty (but ward/ER/EEG/etc do not)
+        # Clinics and ER tomorrow block tonight's resident night duty.
+        # These rows are assigned before nights, so the night pass must avoid
+        # creating an אחרי תורנות conflict after the fact.
         if shift_type in ("ת.מיון", "ת.מיון 2"):
             tomorrow = daily_assignments.get(shift_date + timedelta(days=1), {}).get(n, set())
-            if any(s in CLINIC_SHIFTS for s in tomorrow):
-                note(n, "tomorrow clinic blocks night");  continue
+            if any(s in CLINIC_SHIFTS or s == "מיון" for s in tomorrow):
+                note(n, "tomorrow morning blocks night");  continue
 
         # ── mandatory post-ת.מיון rest ────────────────────────────
         if shift_date in blocked_next_day.get(n, set()):

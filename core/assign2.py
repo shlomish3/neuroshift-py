@@ -343,10 +343,109 @@ def auto_assign(month: str, dry_run: bool = False) -> pd.DataFrame:
         for name in _names(row.Assigned)
     )
 
+    def _resident_night_names(d: date) -> set[str]:
+        out: set[str] = set()
+        for name, shifts in daily_assignments.get(d, {}).items():
+            if shifts.intersection({"ת.מיון", "ת.מיון 2"}):
+                out.add(name)
+        return out
+
+    alternate_credits: list[tuple[str, date, str]] = []
+    marked_alternate_credits: set[tuple[str, str, str]] = set()
+
+    def _alternate_credit_key(name: str, earned_date: date, reason: str) -> tuple[str, str, str]:
+        return (name, earned_date.isoformat(), reason)
+
+    def _alternate_row_index(d_iso: str) -> int | None:
+        mask = (roster["Date"] == d_iso) & (roster["Shift"] == "חלופי")
+        if not mask.any():
+            return None
+        return roster.index[mask][0]
+
+    def _mark_manual_alternate(name: str, earned_date: date, reason: str) -> bool:
+        key = _alternate_credit_key(name, earned_date, reason)
+        if key in marked_alternate_credits:
+            return True
+
+        idx = _alternate_row_index(earned_date.isoformat())
+        if idx is None:
+            return False
+
+        marker_prefix = "⚠️ לבחור חלופי: "
+        existing = str(roster.at[idx, "Assigned"] or "").strip()
+        existing_names = list(_names(existing))
+        marker_names: list[str] = []
+
+        if marker_prefix in existing:
+            marker_part = existing.split(marker_prefix, 1)[1]
+            marker_part = marker_part.split(",", 1)[0]
+            marker_names = [x.strip() for x in marker_part.split(" / ") if x.strip()]
+            existing = existing.split(marker_prefix, 1)[0].rstrip(" ,")
+
+        if name not in marker_names:
+            marker_names.append(name)
+
+        marker = marker_prefix + " / ".join(marker_names)
+        if existing_names:
+            roster.at[idx, "Assigned"] = f"{', '.join(existing_names)}, {marker}"
+        else:
+            roster.at[idx, "Assigned"] = marker
+
+        logger.info(
+            "חלופי manual marker: %s for %s (%s)",
+            name, earned_date.isoformat(), reason,
+        )
+        marked_alternate_credits.add(key)
+        return True
+
+    def _build_alternate_credits() -> list[tuple[str, date, str]]:
+        credits: list[tuple[str, date, str]] = []
+        yr, mon = map(int, month.split("-"))
+        first = date(yr, mon, 1)
+        last = (first.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+
+        cur = first
+        while cur <= last:
+            if cur.weekday() == 4:
+                for name in sorted(_resident_night_names(cur)):
+                    credits.append((name, cur, "Friday resident night"))
+
+            elif cur.weekday() == 5:
+                sat_names = _resident_night_names(cur)
+                paired_names = sat_names & (
+                    _resident_night_names(cur - timedelta(days=1))
+                    | _resident_night_names(cur - timedelta(days=2))
+                )
+                for name in sorted(paired_names):
+                    credits.append((name, cur, "Saturday resident night after Thu/Fri"))
+
+            cur += timedelta(days=1)
+
+        return credits
+
+    def _mark_all_manual_alternates() -> int:
+        marked = 0
+        for name, earned_date, reason in alternate_credits:
+            if _mark_manual_alternate(name, earned_date, reason):
+                marked += 1
+        return marked
+
+    handled_night_duties = False
+    night_shift_order = {"ת.מיון": 0, "ת.מיון 2": 1, "כונן מיון": 2}
 
     for bucket in PRIORITY_BUCKETS:
-        # (optional) guard against out-of-order rows inside the bucket
-        for idx, row in roster[roster["Shift"] == bucket].sort_values("Date").iterrows():
+        if bucket in NIGHT_DUTY_SHIFTS:
+            if handled_night_duties:
+                continue
+            handled_night_duties = True
+            bucket_rows = roster[roster["Shift"].isin(NIGHT_DUTY_SHIFTS)].copy()
+            bucket_rows["_shift_order"] = bucket_rows["Shift"].map(night_shift_order)
+            row_iter = bucket_rows.sort_values(["Date", "_shift_order"]).iterrows()
+        else:
+            # (optional) guard against out-of-order rows inside the bucket
+            row_iter = roster[roster["Shift"] == bucket].sort_values("Date").iterrows()
+
+        for idx, row in row_iter:
             needed = int(row.Needed)
             soft   = int(row.SoftCap)
 
@@ -468,6 +567,14 @@ def auto_assign(month: str, dry_run: bool = False) -> pd.DataFrame:
             elif current:
                 roster.at[idx, "Assigned"] = ", ".join(current)
             filled_so_far += len(current)
+
+        if bucket in NIGHT_DUTY_SHIFTS:
+            alternate_credits = _build_alternate_credits()
+            manual_alternates = _mark_all_manual_alternates()
+            logger.info(
+                "חלופי manual markers complete: %d/%d earned days marked",
+                manual_alternates, len(alternate_credits),
+            )
     print(f"    -> bucket done ({filled_so_far}/{total_slots} shifts filled)")
 
     # ───── final clinic-mute pass (dynamic attendings) ─────

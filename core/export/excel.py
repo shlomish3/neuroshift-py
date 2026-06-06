@@ -379,11 +379,10 @@ def _clear_range(
 
 def _prepare_month_sheet(ws) -> None:
     """
-    Clear only the exported calendar area (A:H).
-    Do NOT clear the whole sheet, because the template contains summary
-    formulas/tables to the right (J and onward) that must be preserved.
+    Clear the exported calendar area and the generated summary table.
     """
     _clear_range(ws, 1, 1, ws.max_row, 8, clear_merges=True)   # A:H only
+    _clear_range(ws, 1, 9, ws.max_row, 19, clear_merges=False)  # I:S summary
     ws.sheet_view.rightToLeft = True
     ws.freeze_panes = None
 
@@ -392,11 +391,12 @@ def _prepare_toranut_sheet(ws) -> None:
     Clear only the areas owned by the Python exporter:
     - main toranut table in B:F
     - available-worker/formula area in H
+    - generated counting/formula area in I:Q
     - helper night-unavailability column in R
-    Preserve the template-owned counting/formula area in I:Q.
     """
     _clear_range(ws, 1, 2, ws.max_row, 6, clear_merges=True)  # B:F
     _clear_range(ws, 1, 8, ws.max_row, 8, clear_merges=False)  # H:H
+    _clear_range(ws, 1, 9, ws.max_row, 17, clear_merges=False)  # I:Q
     _clear_range(ws, 1, 18, ws.max_row, 18, clear_merges=False)  # R:R
     ws.sheet_view.rightToLeft = True
     ws.freeze_panes = None
@@ -654,44 +654,223 @@ def _set_unassigned_formula_row(
         elif d + timedelta(days=1) in holiday_names:
             cell.fill = _ORANGE
 
-def _build_toranut_summary_table(ws) -> None:
+def _summary_names() -> List[str]:
+    return TORANUT_SENIORS + TORANUT_RESIDENTS
+
+def _formula_ref_list(refs: Sequence[str]) -> str:
+    return ",".join(refs) if refs else '""'
+
+def _count_name_in_refs_formula(name_ref: str, refs: Sequence[str]) -> str:
+    if not refs:
+        return "=0"
+
+    joined_refs = _formula_ref_list(refs)
+    return (
+        f'=_xlfn.LET('
+        f'_xlpm.joined,SUBSTITUTE(_xlfn.TEXTJOIN(",",TRUE,{joined_refs}),CHAR(10),","),'
+        f'_xlpm.raw,_xlfn.TEXTSPLIT(_xlpm.joined,","),'
+        f'_xlpm.tokens,_xlfn._xlws.FILTER(TRIM(_xlpm.raw),TRIM(_xlpm.raw)<>""),'
+        f'IFERROR(SUMPRODUCT(--(_xlpm.tokens={name_ref})),0)'
+        f')'
+    )
+
+def _count_name_in_ref_groups_formula(name_ref: str, ref_groups: Sequence[Sequence[str]]) -> str:
+    group_checks: List[str] = []
+    for refs in ref_groups:
+        if not refs:
+            continue
+        joined_refs = _formula_ref_list(refs)
+        group_checks.append(
+            f'IFERROR(--ISNUMBER(_xlfn.XMATCH('
+            f'{name_ref},'
+            f'TRIM(_xlfn.TEXTSPLIT(SUBSTITUTE(_xlfn.TEXTJOIN(",",TRUE,{joined_refs}),CHAR(10),","),","))'
+            f')),0)'
+        )
+
+    if not group_checks:
+        return "=0"
+    return f'=_xlfn.LET(_xlpm.name,{name_ref},SUM({",".join(group_checks)}))'
+
+def _apply_summary_table_style(
+    ws,
+    *,
+    min_row: int,
+    max_row: int,
+    min_col: int,
+    max_col: int,
+    name_col: int,
+) -> None:
+    header_fill = PatternFill("solid", fgColor="D9EAD3")
+    senior_fill = PatternFill("solid", fgColor="CDEBF7")
+    resident_fill = PatternFill("solid", fgColor="C6EFCE")
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for row in range(min_row, max_row + 1):
+        for col in range(min_col, max_col + 1):
+            cell = ws.cell(row, col)
+            cell.border = border
+            cell.alignment = Alignment(
+                horizontal="center" if row == min_row or col != name_col else "right",
+                vertical="center",
+                wrap_text=True,
+                readingOrder=2,
+            )
+            if row == min_row:
+                cell.font = Font(bold=True)
+                cell.fill = header_fill
+            elif col == name_col:
+                cell.fill = senior_fill if row < min_row + 1 + len(TORANUT_SENIORS) else resident_fill
+
+def _write_array_formula(cell, formula: str) -> None:
+    cell.value = ArrayFormula(cell.coordinate, formula)
+
+def _build_month_summary_table(
+    ws,
+    *,
+    month: str,
+    refs_by_metric: Dict[str, Sequence[str]],
+    friday_ref_groups: Sequence[Sequence[str]],
+) -> None:
+    headers = [
+        "שם",
+        "ייעוצים",
+        "ימי שישי",
+        "מחקר",
+        "EEG",
+        "חופש (א-ה)",
+        "רוטציה",
+        "תורנויות",
+        "כוננויות",
+        "לא שובצו",
+    ]
+    start_row = 3
+    start_col = 10  # J
+
+    for offset, header in enumerate(headers):
+        ws.cell(start_row, start_col + offset, header)
+        ws.column_dimensions[get_column_letter(start_col + offset)].width = 14
+    ws.column_dimensions["J"].width = 18
+    ws.column_dimensions["O"].width = 16
+    ws.column_dimensions["S"].width = 16
+
+    metric_to_col = {
+        "ייעוצים": 11,
+        "ימי שישי": 12,
+        "מחקר": 13,
+        "EEG": 14,
+        "חופש": 15,
+        "רוטציה": 16,
+        "תורנויות": 17,
+        "כוננויות": 18,
+        "לא שובצו": 19,
+    }
+
+    for row_offset, name in enumerate(_summary_names(), start=1):
+        row = start_row + row_offset
+        name_ref = f"$J{row}"
+        ws.cell(row, 10, name)
+
+        for metric, col in metric_to_col.items():
+            cell = ws.cell(row, col)
+            if metric == "ימי שישי":
+                _write_array_formula(cell, _count_name_in_ref_groups_formula(name_ref, friday_ref_groups))
+            else:
+                _write_array_formula(cell, _count_name_in_refs_formula(name_ref, refs_by_metric.get(metric, [])))
+
+    _apply_summary_table_style(
+        ws,
+        min_row=start_row,
+        max_row=start_row + len(_summary_names()),
+        min_col=start_col,
+        max_col=start_col + len(headers) - 1,
+        name_col=10,
+    )
+
+def _build_toranut_summary_table(ws, *, first_day_row: int, last_day_row: int) -> None:
     blue = PatternFill("solid", fgColor="CDEBF7")
     green = PatternFill("solid", fgColor="C6EFCE")
     header_fill = PatternFill("solid", fgColor="D9EAD3")
     thin = Side(style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    ws.column_dimensions["I"].width = 22
-    ws.cell(3, 9, "תמונת מצב").font = Font(bold=True)
-    ws.cell(3, 9).fill = header_fill
-    ws.cell(3, 9).alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
-    ws.cell(3, 9).border = border
+    headers = ["", "כ.מיון", "ת.מיון", "ת.מיון 2", "שישי/שבת", "ימי רביעי", "ימי חמישי", "סנדוויץ'", 'סה"כ']
+    for offset, header in enumerate(headers):
+        col = 9 + offset
+        cell = ws.cell(4, col, header)
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True, readingOrder=2)
+        cell.border = border
+        ws.column_dimensions[get_column_letter(col)].width = 13
+    ws.column_dimensions["I"].width = 18
+    ws.column_dimensions["M"].width = 14
+    ws.column_dimensions["P"].width = 14
+    ws.column_dimensions["Q"].width = 10
 
-    row = 4
-    ws.cell(row, 9, "בכירים").font = Font(bold=True)
-    ws.cell(row, 9).fill = blue
-    ws.cell(row, 9).alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
-    ws.cell(row, 9).border = border
-    row += 1
-    for name in TORANUT_SENIORS:
+    rows_by_name: Dict[str, int] = {}
+    row = 5
+    for name in _summary_names():
+        rows_by_name[name] = row
         cell = ws.cell(row, 9, name)
-        cell.fill = blue
+        cell.fill = blue if name in TORANUT_SENIORS else green
         cell.alignment = Alignment(horizontal="right", vertical="center", readingOrder=2)
         cell.border = border
         row += 1
 
-    row += 1
-    ws.cell(row, 9, "מתמחים").font = Font(bold=True)
-    ws.cell(row, 9).fill = green
-    ws.cell(row, 9).alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
-    ws.cell(row, 9).border = border
-    row += 1
-    for name in TORANUT_RESIDENTS:
-        cell = ws.cell(row, 9, name)
-        cell.fill = green
-        cell.alignment = Alignment(horizontal="right", vertical="center", readingOrder=2)
-        cell.border = border
-        row += 1
+    date_rows: Dict[date, int] = {}
+    for r in range(first_day_row, last_day_row + 1):
+        try:
+            d = datetime.strptime(str(ws.cell(r, 2).value), "%d/%m/%Y").date()
+        except Exception:
+            continue
+        date_rows[d] = r
+
+    all_rows = list(range(first_day_row, last_day_row + 1))
+    weekend_rows = [r for d, r in date_rows.items() if d.weekday() in (4, 5)]
+    wed_rows = [r for d, r in date_rows.items() if d.weekday() == 2]
+    thu_rows = [r for d, r in date_rows.items() if d.weekday() == 3]
+
+    def refs_for(rows: Sequence[int], cols: Sequence[int]) -> List[str]:
+        return [f"${get_column_letter(c)}${r}" for r in rows for c in cols]
+
+    for name, row in rows_by_name.items():
+        name_ref = f"$I{row}"
+        formulas = {
+            10: _count_name_in_refs_formula(name_ref, refs_for(all_rows, [6])),           # J כ.מיון
+            11: _count_name_in_refs_formula(name_ref, refs_for(all_rows, [4])),           # K ת.מיון
+            12: _count_name_in_refs_formula(name_ref, refs_for(all_rows, [5])),           # L ת.מיון 2
+            13: _count_name_in_refs_formula(name_ref, refs_for(weekend_rows, [4, 5, 6])), # M שישי/שבת
+            14: _count_name_in_refs_formula(name_ref, refs_for(wed_rows, [4, 5])),        # N ימי רביעי
+            15: _count_name_in_refs_formula(name_ref, refs_for(thu_rows, [4, 5])),        # O ימי חמישי
+        }
+
+        for col, formula in formulas.items():
+            _write_array_formula(ws.cell(row, col), formula)
+
+        if last_day_row - first_day_row >= 2:
+            first_sandwich = first_day_row
+            last_sandwich = last_day_row - 2
+            ws.cell(row, 16).value = (
+                f'=SUMPRODUCT('
+                f'SIGN(($D${first_sandwich}:$D${last_sandwich}=$I{row})+($E${first_sandwich}:$E${last_sandwich}=$I{row}))*'
+                f'(1-SIGN(($D${first_sandwich + 1}:$D${last_sandwich + 1}=$I{row})+($E${first_sandwich + 1}:$E${last_sandwich + 1}=$I{row})))*'
+                f'SIGN(($D${first_sandwich + 2}:$D${last_sandwich + 2}=$I{row})+($E${first_sandwich + 2}:$E${last_sandwich + 2}=$I{row}))'
+                f')'
+            )
+        else:
+            ws.cell(row, 16).value = 0
+
+        ws.cell(row, 17).value = f"=J{row}+K{row}+L{row}"
+
+        for col in range(10, 18):
+            cell = ws.cell(row, col)
+            cell.alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
+            cell.border = border
+
+    for r in range(4, row):
+        for c in range(9, 18):
+            ws.cell(r, c).border = border
 
 def _build_sheet_toranut(
     ws,
@@ -878,6 +1057,7 @@ def _build_sheet_toranut(
         if r == 3:
             cell.font = Font(bold=True)
 
+    _build_toranut_summary_table(ws, first_day_row=4, last_day_row=last_row)
     ws.freeze_panes = ws["C4"]
 
 def _build_sheet_ovdim(ws):
@@ -1264,11 +1444,30 @@ def export_month_to_xlsx(
     toren_machlaka_ref_by_date: Dict[str, str] = {}
     after_cell_pos_by_date: Dict[str, tuple[int, int]] = {}
     friday_refs_by_date: Dict[str, List[str]] = {}
+    month_summary_refs: Dict[str, List[str]] = {
+        "ייעוצים": [],
+        "מחקר": [],
+        "EEG": [],
+        "חופש": [],
+        "רוטציה": [],
+        "תורנויות": [],
+        "כוננויות": [],
+        "לא שובצו": [],
+    }
+    month_friday_ref_groups: List[List[str]] = []
 
     yoatz_row_off = 2 + SHIFT_ORDER.index("ייעוצים מובילים")
     toren_mion_row_off = 2 + SHIFT_ORDER.index("ת.מיון")
     toren_mach_row_off = 2 + SHIFT_ORDER.index("ת.מיון 2")
+    konen_mion_row_off = 2 + SHIFT_ORDER.index("כונן מיון")
     after_row_off = 2 + SHIFT_ORDER.index("אחרי תורנות")
+    summary_shift_row_offsets = {
+        "ייעוצים": 2 + SHIFT_ORDER.index("ייעוצים מובילים"),
+        "מחקר": 2 + SHIFT_ORDER.index("מחקר"),
+        "EEG": 2 + SHIFT_ORDER.index("EEG"),
+        "חופש": 2 + SHIFT_ORDER.index("חופש"),
+        "רוטציה": 2 + SHIFT_ORDER.index("רוטציה"),
+    }
     friday_row_offsets = {
         shift: 2 + SHIFT_ORDER.index(shift)
         for shift in FRIDAY_LINK_SHIFTS
@@ -1281,7 +1480,9 @@ def export_month_to_xlsx(
         yoatz_row = block_start + yoatz_row_off
         tmion_row = block_start + toren_mion_row_off
         tmach_row = block_start + toren_mach_row_off
+        konen_row = block_start + konen_mion_row_off
         after_row = block_start + after_row_off
+        unassigned_row = block_start + 2 + len(SHIFT_ORDER)
 
         for i, dte in enumerate(seven):
             col = 2 + i  # B..H
@@ -1292,11 +1493,29 @@ def export_month_to_xlsx(
             toren_mion_ref_by_date[d_iso] = f"'{month}'!{col_letter}${tmion_row}"
             toren_machlaka_ref_by_date[d_iso] = f"'{month}'!{col_letter}${tmach_row}"
             after_cell_pos_by_date[d_iso] = (after_row, col)
+            if dte.month == mon:
+                for metric, row_off in summary_shift_row_offsets.items():
+                    if metric == "חופש" and dte.weekday() not in (6, 0, 1, 2, 3):
+                        continue
+                    month_summary_refs[metric].append(
+                        f"'{month}'!{col_letter}${block_start + row_off}"
+                    )
+
+                month_summary_refs["תורנויות"].extend([
+                    f"'{month}'!{col_letter}${tmion_row}",
+                    f"'{month}'!{col_letter}${tmach_row}",
+                ])
+                month_summary_refs["כוננויות"].append(f"'{month}'!{col_letter}${konen_row}")
+
+                if dte.weekday() in (6, 0, 1, 2, 3):
+                    month_summary_refs["לא שובצו"].append(f"'{month}'!{col_letter}${unassigned_row}")
+
             if dte.month == mon and dte.weekday() == 4:
                 friday_refs_by_date[d_iso] = [
                     f"'{month}'!{col_letter}${block_start + row_off}"
                     for row_off in friday_row_offsets.values()
                 ]
+                month_friday_ref_groups.append(friday_refs_by_date[d_iso])
 
         pivot = _pivot_for_days(
             roster_df,
@@ -1374,6 +1593,12 @@ def export_month_to_xlsx(
         )
 
     ws.freeze_panes = ws["A2"]
+    _build_month_summary_table(
+        ws,
+        month=month,
+        refs_by_metric=month_summary_refs,
+        friday_ref_groups=month_friday_ref_groups,
+    )
 
     # ----------------------------------------------------------
     # Rebuild the fixed sheets in-place
