@@ -468,7 +468,7 @@ def auto_assign(month: str, dry_run: bool = False) -> pd.DataFrame:
             elif current:
                 roster.at[idx, "Assigned"] = ", ".join(current)
             filled_so_far += len(current)
-    print(f"    ↳ bucket done ({filled_so_far}/{total_slots} shifts filled)")
+    print(f"    -> bucket done ({filled_so_far}/{total_slots} shifts filled)")
 
     # ───── final clinic-mute pass (dynamic attendings) ─────
     for idx, row in roster[roster["Shift"] == "אטנדינג"].iterrows():
@@ -567,5 +567,5 @@ if __name__ == "__main__":
                                     month=ns.month,
                                     out_dir=ns.out_dir)
 
-    print("✓ Roster exported to", path)
+    print("[v] Roster exported to", path)
     print("Done")

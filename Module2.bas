@@ -1,16 +1,8 @@
 Attribute VB_Name = "Module2"
 Option Explicit
 
-' Month sheet layout:
-'   each weekly block starts with 2 header rows,
-'   then the 31 SHIFT_ORDER rows from core/export/excel.py,
-'   then one "unassigned" formula row and one spacer row.
 Private Const COL_FIRST As Long = 2
 Private Const COL_LAST As Long = 8
-Private Const BLOCK_FIRST_ROW As Long = 1
-Private Const BLOCK_HEIGHT As Long = 35
-Private Const BLOCK_DATA_OFFSET As Long = 2
-Private Const SHIFT_COUNT As Long = 31
 Private Const USE_CASE_SENSITIVE As Boolean = False
 
 Private Const COLOR_DUP As Long = vbRed
@@ -18,9 +10,7 @@ Private Const COLOR_WARN As Long = 33023
 Private Const COLOR_NORM As Long = vbBlack
 
 Public Sub Auto_Open()
-    ' Intentionally left blank.
-    ' Automatic recoloring changes workbook formatting on open and clears Excel Undo.
-    ' Duplicate highlighting is now generated as workbook conditional formatting.
+    RecolorNeuroShiftWorkbook
 End Sub
 
 Public Sub RecolorNeuroShiftWorkbook()
@@ -45,7 +35,7 @@ End Sub
 
 Public Sub RecolorDuplicateNamesAllForSheet(ByVal ws As Worksheet, Optional ByVal manageApplicationState As Boolean = True)
     Dim lastRow As Long: lastRow = LastUsedRow(ws)
-    If lastRow < BLOCK_FIRST_ROW + BLOCK_DATA_OFFSET Then Exit Sub
+    If lastRow < 3 Then Exit Sub
 
     Dim oldEvents As Boolean, oldScreenUpdating As Boolean
     If manageApplicationState Then
@@ -58,16 +48,53 @@ Public Sub RecolorDuplicateNamesAllForSheet(ByVal ws As Worksheet, Optional ByVa
 
     On Error GoTo CleanUp
 
+    ' Reset font color to black for data area
     ws.Range(ws.Cells(1, COL_FIRST), ws.Cells(lastRow, COL_LAST)).Font.Color = COLOR_NORM
 
-    Dim blockStart As Long, colIdx As Long
-    For blockStart = BLOCK_FIRST_ROW To lastRow Step BLOCK_HEIGHT
-        If blockStart + BLOCK_DATA_OFFSET + SHIFT_COUNT - 1 <= lastRow Then
+    Dim r As Long, colIdx As Long
+    Dim blockStart As Long, dataRow As Long
+    Dim shiftName As String
+    
+    Dim morningRows As Collection
+    Dim nightRows As Collection
+    Dim offRows As Collection
+
+    r = 1
+    Do While r <= lastRow
+        If IsBlockHeader(SafeCStr(ws.Cells(r, 1).Value2)) Then
+            blockStart = r
+            dataRow = blockStart + 1
+            
+            Set morningRows = New Collection
+            Set nightRows = New Collection
+            Set offRows = New Collection
+            
+            Do While dataRow <= lastRow
+                shiftName = SafeCStr(ws.Cells(dataRow, 1).Value2)
+                If shiftName = "" Or IsUnassignedRow(shiftName) Then Exit Do
+                
+                If IsNightShift(shiftName) Then
+                    nightRows.Add dataRow
+                ElseIf IsOffWarningShift(shiftName) Then
+                    offRows.Add dataRow
+                    morningRows.Add dataRow
+                ElseIf IsExcludedShift(shiftName) Then
+                    ' Ignore excluded shifts
+                Else
+                    morningRows.Add dataRow
+                End If
+                dataRow = dataRow + 1
+            Loop
+            
             For colIdx = COL_FIRST To COL_LAST
-                ColorConflictsInBlock ws, blockStart, colIdx
+                ColorConflictsInBlock ws, colIdx, morningRows, nightRows, offRows
             Next colIdx
+            
+            r = dataRow ' skip past this block
+        Else
+            r = r + 1
         End If
-    Next blockStart
+    Loop
 
 CleanUp:
     If manageApplicationState Then
@@ -84,11 +111,72 @@ Private Function IsMonthSheet(ByVal ws As Worksheet) As Boolean
     IsMonthSheet = True
 End Function
 
-Private Sub ColorConflictsInBlock(ByVal ws As Worksheet, ByVal blockStart As Long, ByVal colIdx As Long)
-    Dim morningRows As Collection: Set morningRows = RowsForShiftIndexes(blockStart, MorningShiftIndexes())
-    Dim nightRows As Collection: Set nightRows = RowsForShiftIndexes(blockStart, NightShiftIndexes())
-    Dim offRows As Collection: Set offRows = RowsForShiftIndexes(blockStart, OffWarningShiftIndexes())
+Private Function IsBlockHeader(ByVal shiftName As String) As Boolean
+    IsBlockHeader = (NormalizeKey(shiftName) = NormalizeKey(HebTask()))
+End Function
 
+Private Function IsUnassignedRow(ByVal shiftName As String) As Boolean
+    IsUnassignedRow = (InStr(1, shiftName, HebUnassigned(), vbTextCompare) > 0)
+End Function
+
+Private Function IsNightShift(ByVal shiftName As String) As Boolean
+    Dim key As String: key = NormalizeKey(shiftName)
+    IsNightShift = (key = NormalizeKey(HebToranMion()) _
+        Or key = NormalizeKey(HebToranMion2()) _
+        Or key = NormalizeKey(HebConanMion()))
+End Function
+
+Private Function IsOffWarningShift(ByVal shiftName As String) As Boolean
+    Dim key As String: key = NormalizeKey(shiftName)
+    IsOffWarningShift = (key = NormalizeKey(HebVacation()) _
+        Or key = NormalizeKey(HebAlternate()))
+End Function
+
+Private Function IsExcludedShift(ByVal shiftName As String) As Boolean
+    Dim key As String: key = NormalizeKey(shiftName)
+    IsExcludedShift = (key = NormalizeKey(HebDayAdmission()) _
+        Or key = NormalizeKey(HebIntubation()))
+End Function
+
+' Keep Hebrew literals out of the .bas source. Excel imports .bas files using
+' the local ANSI code page, which can corrupt UTF-8 Hebrew string literals.
+Private Function HebTask() As String
+    HebTask = ChrW$(&H05EA) & ChrW$(&H05E4) & ChrW$(&H05E7) & ChrW$(&H05D9) & ChrW$(&H05D3)
+End Function
+
+Private Function HebUnassigned() As String
+    HebUnassigned = ChrW$(&H05DC) & ChrW$(&H05D0) & " " & ChrW$(&H05E9) & ChrW$(&H05D5) & ChrW$(&H05D1) & ChrW$(&H05E6) & ChrW$(&H05D5)
+End Function
+
+Private Function HebToranMion() As String
+    HebToranMion = ChrW$(&H05EA) & "." & ChrW$(&H05DE) & ChrW$(&H05D9) & ChrW$(&H05D5) & ChrW$(&H05DF)
+End Function
+
+Private Function HebToranMion2() As String
+    HebToranMion2 = HebToranMion() & " 2"
+End Function
+
+Private Function HebConanMion() As String
+    HebConanMion = ChrW$(&H05DB) & ChrW$(&H05D5) & ChrW$(&H05E0) & ChrW$(&H05DF) & " " & ChrW$(&H05DE) & ChrW$(&H05D9) & ChrW$(&H05D5) & ChrW$(&H05DF)
+End Function
+
+Private Function HebVacation() As String
+    HebVacation = ChrW$(&H05D7) & ChrW$(&H05D5) & ChrW$(&H05E4) & ChrW$(&H05E9)
+End Function
+
+Private Function HebAlternate() As String
+    HebAlternate = ChrW$(&H05D7) & ChrW$(&H05DC) & ChrW$(&H05D5) & ChrW$(&H05E4) & ChrW$(&H05D9)
+End Function
+
+Private Function HebDayAdmission() As String
+    HebDayAdmission = ChrW$(&H05D0) & ChrW$(&H05E9) & ChrW$(&H05E4) & ChrW$(&H05D5) & ChrW$(&H05D6) & " " & ChrW$(&H05D9) & ChrW$(&H05D5) & ChrW$(&H05DD)
+End Function
+
+Private Function HebIntubation() As String
+    HebIntubation = ChrW$(&H05D0) & ChrW$(&H05D9) & ChrW$(&H05E0) & ChrW$(&H05D8) & ChrW$(&H05D5) & ChrW$(&H05D1) & ChrW$(&H05E6) & ChrW$(&H05D9) & ChrW$(&H05D4)
+End Function
+
+Private Sub ColorConflictsInBlock(ByVal ws As Worksheet, ByVal colIdx As Long, ByVal morningRows As Collection, ByVal nightRows As Collection, ByVal offRows As Collection)
     Dim morningCounts As Object: Set morningCounts = NewDictionary()
     Dim nightCounts As Object: Set nightCounts = NewDictionary()
     Dim offCounts As Object: Set offCounts = NewDictionary()
@@ -98,48 +186,19 @@ Private Sub ColorConflictsInBlock(ByVal ws As Worksheet, ByVal blockStart As Lon
     CountTokensInRows ws, colIdx, offRows, offCounts
 
     Dim morningDuplicates As Object: Set morningDuplicates = KeysWithMinimumCount(morningCounts, 2)
-    Dim nightWarnings As Object: Set nightWarnings = KeysWithMinimumCount(nightCounts, 2)
+    Dim nightDuplicates As Object: Set nightDuplicates = KeysWithMinimumCount(nightCounts, 2)
     Dim offNightWarnings As Object: Set offNightWarnings = IntersectKeys(nightCounts, offCounts)
 
-    AddKeys nightWarnings, offNightWarnings
-
     ColorRowsByKeys ws, colIdx, morningRows, morningDuplicates, COLOR_DUP
-    ColorRowsByKeys ws, colIdx, nightRows, nightWarnings, COLOR_WARN
+    ColorRowsByKeys ws, colIdx, nightRows, offNightWarnings, COLOR_WARN
     ColorRowsByKeys ws, colIdx, offRows, offNightWarnings, COLOR_WARN
+    ColorRowsByKeys ws, colIdx, nightRows, nightDuplicates, COLOR_DUP
 End Sub
-
-Private Function MorningShiftIndexes() As Variant
-    ' Zero-based indexes inside SHIFT_ORDER.
-    ' Excludes: hospitalization day, night shifts, intubation.
-    MorningShiftIndexes = Array( _
-        0, 1, 2, 8, 9, _
-        10, 11, 12, 13, 14, 15, 16, _
-        17, 18, 19, 20, 21, 22, 23, _
-        24, 25, 26, 27, 28, 29, 30 _
-    )
-End Function
-
-Private Function NightShiftIndexes() As Variant
-    NightShiftIndexes = Array(4, 5, 6)
-End Function
-
-Private Function OffWarningShiftIndexes() As Variant
-    OffWarningShiftIndexes = Array(28, 29)
-End Function
-
-Private Function RowsForShiftIndexes(ByVal blockStart As Long, ByVal indexes As Variant) As Collection
-    Dim rows As New Collection
-    Dim i As Long
-    For i = LBound(indexes) To UBound(indexes)
-        rows.Add blockStart + BLOCK_DATA_OFFSET + CLng(indexes(i))
-    Next i
-    Set RowsForShiftIndexes = rows
-End Function
 
 Private Sub CountTokensInRows(ByVal ws As Worksheet, ByVal colIdx As Long, ByVal rows As Collection, ByVal counts As Object)
     Dim item As Variant, toks As Variant, tok As Variant, key As String
     For Each item In rows
-        toks = SplitTokens(CStr(ws.Cells(CLng(item), colIdx).Value2))
+        toks = SplitTokens(SafeCStr(ws.Cells(CLng(item), colIdx).Value2))
         For Each tok In toks
             key = NormalizeKey(CStr(tok))
             If Len(key) > 0 And key <> "-" Then IncrementCount counts, key
@@ -157,7 +216,7 @@ Private Sub ColorRowsByKeys(ByVal ws As Worksheet, ByVal colIdx As Long, ByVal r
 End Sub
 
 Private Sub ColorTokensInCell(ByVal target As Range, ByVal keys As Object, ByVal colorValue As Long)
-    Dim txt As String: txt = CStr(target.Value2)
+    Dim txt As String: txt = SafeCStr(target.Value2)
     If Len(txt) = 0 Then Exit Sub
 
     Dim raw As Variant: raw = Split(txt, ",")
@@ -179,9 +238,15 @@ Private Sub ColorTokensInCell(ByVal target As Range, ByVal keys As Object, ByVal
                 charStart = partStart + firstOffset - 1
                 charLen = lastOffset - firstOffset + 1
 
-                On Error Resume Next
-                target.Characters(charStart, charLen).Font.Color = colorValue
-                On Error GoTo 0
+                
+                If target.HasFormula Then
+                    target.Font.Color = colorValue
+                Else
+                    On Error Resume Next
+                    target.Characters(charStart, charLen).Font.Color = colorValue
+                    On Error GoTo 0
+                End If
+                
             End If
         End If
 
@@ -216,13 +281,6 @@ Private Function IntersectKeys(ByVal leftCounts As Object, ByVal rightCounts As 
     Next key
     Set IntersectKeys = d
 End Function
-
-Private Sub AddKeys(ByVal target As Object, ByVal source As Object)
-    Dim key As Variant
-    For Each key In source.Keys
-        target(CStr(key)) = True
-    Next key
-End Sub
 
 Private Sub IncrementCount(ByVal counts As Object, ByVal key As String)
     If counts.Exists(key) Then
@@ -283,6 +341,16 @@ Private Function LastUsedRow(ByVal ws As Worksheet) As Long
         LastUsedRow = 0
     Else
         LastUsedRow = found.Row
+    End If
+End Function
+
+Private Function SafeCStr(ByVal val As Variant) As String
+    If IsError(val) Then
+        SafeCStr = ""
+    ElseIf IsNull(val) Or IsEmpty(val) Then
+        SafeCStr = ""
+    Else
+        SafeCStr = Trim(CStr(val))
     End If
 End Function
 

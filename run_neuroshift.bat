@@ -5,6 +5,17 @@ cd /d "%~dp0"
 
 echo Neuro Shift roster export
 echo.
+echo Updating Excel macro template...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\update_template_vba.ps1"
+if not %errorlevel%==0 (
+  echo Could not update the Excel VBA template automatically.
+  echo Close Excel, make sure VBA project access is enabled, then run this again.
+  echo The roster was not created because it would use stale coloring logic.
+  echo.
+  pause
+  exit /b 1
+)
+
 set /p YEAR=Enter year, for example 2026: 
 set /p MONTH=Enter month number, for example 6 or 06: 
 

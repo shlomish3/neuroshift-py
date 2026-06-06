@@ -391,14 +391,13 @@ def _prepare_toranut_sheet(ws) -> None:
     """
     Clear only the areas owned by the Python exporter:
     - main toranut table in B:F
-    - available-worker/formula area in H:I
+    - available-worker/formula area in H
     - helper night-unavailability column in R
-    Preserve the counting/formula area in between.
+    Preserve the template-owned counting/formula area in I:Q.
     """
     _clear_range(ws, 1, 2, ws.max_row, 6, clear_merges=True)  # B:F
-    _clear_range(ws, 1, 8, ws.max_row, 9, clear_merges=True)  # H:I
+    _clear_range(ws, 1, 8, ws.max_row, 8, clear_merges=False)  # H:H
     _clear_range(ws, 1, 18, ws.max_row, 18, clear_merges=False)  # R:R
-    _clear_range(ws, 1, 24, ws.max_row, 24, clear_merges=False)  # X:X hidden helpers
     ws.sheet_view.rightToLeft = True
     ws.freeze_panes = None
 
@@ -428,12 +427,12 @@ def _save_workbook_atomic(wb: Workbook, out_path: Path) -> None:
     wb.save(tmp_path)
     tmp_path.replace(out_path)
 
-def _ensure_xlsx_name(month: str, fname: str | None) -> str:
+def _ensure_xlsm_name(month: str, fname: str | None) -> str:
     if fname is None:
-        return f"roster_{month}.xlsx"
+        return f"roster_{month}.xlsm"
     p = Path(fname)
-    if p.suffix.lower() != ".xlsx":
-        return f"{p.stem}.xlsx"
+    if p.suffix.lower() != ".xlsm":
+        return f"{p.stem}.xlsm"
     return p.name
 
 _FRIDAY_TOKEN_WIDTH = 99
@@ -474,15 +473,29 @@ def _friday_visible_name_formula(
     col_letter: str,
     helper_start_row: int,
     helper_end_row: int,
-    visible_index: int,
+    visible_start_row: int,
+    visible_row: int,
 ) -> str:
-    helper_range = f"{col_letter}${helper_start_row}:{col_letter}${helper_end_row}"
-    first_helper = f"{col_letter}${helper_start_row}"
-    return (
-        f'=IFERROR(INDEX({helper_range},'
-        f'AGGREGATE(15,6,(ROW({helper_range})-ROW({first_helper})+1)/({helper_range}<>""),'
-        f'{visible_index})),"")'
-    )
+    """
+    Pick the next non-empty hidden helper name using only scalar references.
+
+    Excel adds the implicit-intersection '@' operator to some generated range
+    formulas. These nested scalar checks avoid that while keeping live links to
+    the month sheet through the hidden helper rows.
+    """
+    previous_visible = [
+        f"{col_letter}${r}"
+        for r in range(visible_start_row, visible_row)
+    ]
+
+    expr = '""'
+    for helper_row in range(helper_end_row, helper_start_row - 1, -1):
+        helper_ref = f"{col_letter}${helper_row}"
+        checks = [f'{helper_ref}<>""']
+        checks.extend(f"{helper_ref}<>{prev}" for prev in previous_visible)
+        expr = f'IF(AND({",".join(checks)}),{helper_ref},{expr})'
+
+    return f'=IFERROR({expr},"")'
 
 def _duplicate_name_formula(
     cell_ref: str,
@@ -691,19 +704,21 @@ def _build_sheet_toranut(
 ):
     """
     Sheet 'תורנויות':
-    - Row 1: merged D1:F1 title "תורנויות כוננויות <Month YY>"
+    - Row 1: merged C1:E1 title "תורנויות כוננויות <Month YY>"
     - Row 2: empty spacer row
     - Row 3: headers (B:תאריך, C:יום, D:ת.מיון, E:ת.מיון 2, F:כ.מיון)
     - Rows 4+: one row per day in months
-    - E/F/G are populated from roster_df:
-        E <- ת.מיון
-        F <- ת.מיון 2
-        G <- כונן מיון
+    - D/E/F are populated from roster_df:
+        D <- ת.מיון
+        E <- ת.מיון 2
+        F <- כונן מיון
+    - Column H: available resident formula
+    - Columns I:Q: preserved summary table from the template
     - Column R: names marked "לא זמין לתורנות" for that date
     """
     title = f"תורנויות כוננויות {_heb_month_name(year, mon)}"
-    ws.merge_cells(start_row=1, start_column=4, end_row=1, end_column=6)
-    title_cell = ws.cell(1, 4, title)
+    ws.merge_cells(start_row=1, start_column=3, end_row=1, end_column=5)
+    title_cell = ws.cell(1, 3, title)
     title_cell.font = Font(bold=True, size=14)
     title_cell.alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
 
@@ -727,22 +742,9 @@ def _build_sheet_toranut(
     cell_h.alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
     ws.column_dimensions["H"].width = 30
 
-    _build_toranut_summary_table(ws)
-
-    # Column X is a hidden generated helper list for column H formulas.
-    # Column I is reserved for the senior/resident overview table.
-    helper_col = 24
-    helper_start_row = 4
-    worker_names = TORANUT_SENIORS + TORANUT_RESIDENTS
-    ws.cell(3, helper_col, "workers helper")
-    for idx, name in enumerate(worker_names, start=helper_start_row):
-        ws.cell(idx, helper_col, name)
-    ws.column_dimensions[get_column_letter(helper_col)].hidden = True
-    helper_end_row = helper_start_row + max(len(worker_names), 1) - 1
-    worker_list = (
-        f"${get_column_letter(helper_col)}${helper_start_row}:"
-        f"${get_column_letter(helper_col)}${helper_end_row}"
-    )
+    # The resident list and summary formulas live in the template table at I:Q.
+    # Keep that block untouched and reuse the resident-name range for column H.
+    worker_list = "$I$13:$I$23"
 
     # Build lookup from roster_df
     month_prefix = f"{year:04d}-{mon:02d}"
@@ -1005,13 +1007,13 @@ def _build_sheet_fridays(
 
         for r in range(visible_start_row, visible_end_row + 1):
             cell = ws.cell(r, c)
-            formula = _friday_visible_name_formula(
+            cell.value = _friday_visible_name_formula(
                 col_letter,
                 helper_start_row,
                 helper_end_row,
-                r - visible_start_row + 1,
+                visible_start_row,
+                r,
             )
-            cell.value = ArrayFormula(f"{col_letter}{r}", formula)
             cell.alignment = Alignment(
                 horizontal="right", vertical="top", wrap_text=True, readingOrder=2
             )
@@ -1231,7 +1233,7 @@ def export_month_to_xlsx(
     # Load the formatted template without preserving VBA.
     # Keeping macros/event handlers clears Excel's Undo stack on open/edit.
     # ----------------------------------------------------------
-    wb = load_workbook(template_path, keep_vba=False)
+    wb = load_workbook(template_path, keep_vba=True)
     wb.calculation.calcMode = "auto"
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
@@ -1401,7 +1403,7 @@ def export_month_to_xlsx(
         main_ref_by_date=yoatz_ref_by_date,
     )
 
-    out_path = out_dir / _ensure_xlsx_name(month, fname)
+    out_path = out_dir / _ensure_xlsm_name(month, fname)
     _save_workbook_atomic(wb, out_path)
     return out_path
 
