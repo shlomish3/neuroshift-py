@@ -5,6 +5,7 @@ from pathlib import Path
 import queue
 import threading
 import tkinter as tk
+import time
 from tkinter import filedialog, messagebox, ttk
 import urllib.request
 
@@ -24,6 +25,28 @@ POP_DIRECTIONAL = "\u202c"
 
 def rtl(text: str) -> str:
     return f"{RTL_EMBED}{text}{POP_DIRECTIONAL}"
+
+
+def _assert_excel_target_available(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        return
+    try:
+        import msvcrt
+
+        with path.open("r+b") as fh:
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            finally:
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+    except (OSError, PermissionError) as exc:
+        raise RuntimeError(
+            "קובץ ה-Excel שאליו צריך לייצא כנראה פתוח או נעול.\n"
+            f"יש לסגור אותו ואז להריץ שוב:\n{path}"
+        ) from exc
 
 
 def _refresh_excel_template_if_needed() -> None:
@@ -104,6 +127,7 @@ class NeuroShiftApp(tk.Tk):
         self._spinner_index = 0
         self._progress_label = ""
         self._progress_percent = 0
+        self._run_started_at: float | None = None
 
         today = date.today()
         default_year = today.year + (1 if today.month == 12 else 0)
@@ -337,6 +361,7 @@ class NeuroShiftApp(tk.Tk):
             messagebox.showinfo("Neuro Shift", "פעולה אחרת עדיין רצה.")
             return
         self._busy = True
+        self._run_started_at = time.perf_counter()
         self._set_progress(0, "מתחיל")
         self._log(label)
 
@@ -353,6 +378,7 @@ class NeuroShiftApp(tk.Tk):
         try:
             month = self._target_month()
             out_dir = Path(self.output_dir_var.get().strip() or DEFAULT_OUT_DIR)
+            _assert_excel_target_available(out_dir / f"roster_{month}.xlsm")
         except Exception as exc:
             messagebox.showerror("Neuro Shift", str(exc))
             return
@@ -406,6 +432,12 @@ class NeuroShiftApp(tk.Tk):
         if not path:
             messagebox.showerror("Neuro Shift", "יש לבחור קובץ סידור לשיפור.")
             return
+        try:
+            source = Path(path)
+            _assert_excel_target_available(source.with_name(f"{source.stem}_optimized.xlsm"))
+        except Exception as exc:
+            messagebox.showerror("Neuro Shift", str(exc))
+            return
 
         def task() -> str:
             from core.optimizer import optimize_exported_roster
@@ -441,13 +473,15 @@ class NeuroShiftApp(tk.Tk):
                 if kind == "log":
                     self._log(str(message))
                     continue
+                elapsed = self._format_elapsed()
+                self._run_started_at = None
                 self._busy = False
                 self._set_waiting()
                 if kind == "error":
-                    self._log(f"שגיאה: {message}")
+                    self._log(f"שגיאה: {message}\nמשך הרצה: {elapsed}")
                     messagebox.showerror("Neuro Shift", message)
                 else:
-                    self._log(message)
+                    self._log(f"{message}\nמשך הרצה: {elapsed}")
         except queue.Empty:
             pass
         self._tick_spinner()
@@ -475,7 +509,18 @@ class NeuroShiftApp(tk.Tk):
     def _render_progress_state(self) -> None:
         spinner = self._spinner_frames[self._spinner_index] if self._busy else ""
         suffix = "..." if self._busy else ""
-        self.state_var.set(rtl(f"{self._progress_label} {self._progress_percent}% {spinner}{suffix}"))
+        elapsed = f" | {self._format_elapsed()}" if self._busy else ""
+        self.state_var.set(rtl(f"{self._progress_label} {self._progress_percent}% {spinner}{suffix}{elapsed}"))
+
+    def _format_elapsed(self) -> str:
+        if self._run_started_at is None:
+            return "00:00"
+        total_seconds = max(0, int(round(time.perf_counter() - self._run_started_at)))
+        minutes, seconds = divmod(total_seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
 
     def _log(self, message: str) -> None:
         self.status.configure(state="normal")

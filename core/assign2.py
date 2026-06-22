@@ -947,9 +947,11 @@ def auto_assign(
                 "Removed full-month rotation overridden by rest/vacation: %s %s",
                 d.isoformat(), ", ".join(removed),
             )
+    all_worker_names = workers_df()["שם"].tolist()
+    worker_names_set = set(all_worker_names)
     senior_names = {
         name
-        for name in workers_df()["שם"].tolist()
+        for name in all_worker_names
         if is_senior(name, worker_shift_lut)
     }
     friday_dates_by_name: dict[str, set[date]] = defaultdict(set)
@@ -1070,6 +1072,125 @@ def auto_assign(
             friday_dates_by_name[name].add(d)
             friday_day_counts[name] += 1
 
+    row_date_by_idx: dict[int, date] = {}
+    row_weekday_by_idx: dict[int, int] = {}
+    row_index_by_date_shift: dict[tuple[date, str], int] = {}
+    rows_by_shift: dict[str, list[int]] = defaultdict(list)
+    assigned_names_cache: dict[int, tuple[str, tuple[str, ...]]] = {}
+
+    for idx, row in roster.iterrows():
+        row_idx = int(idx)
+        row_date = date.fromisoformat(str(row["Date"]))
+        row_shift = str(row["Shift"])
+        row_date_by_idx[row_idx] = row_date
+        row_weekday_by_idx[row_idx] = row_date.weekday()
+        row_index_by_date_shift[(row_date, row_shift)] = row_idx
+        rows_by_shift[row_shift].append(row_idx)
+
+    resident_night_row_indexes = [
+        idx
+        for shift in RESIDENT_NIGHT_SHIFTS
+        for idx in rows_by_shift.get(shift, [])
+    ]
+    resident_night_row_indexes.sort(key=lambda idx: (row_date_by_idx[idx], str(roster.at[idx, "Shift"])))
+
+    def _row_date(idx: int) -> date:
+        return row_date_by_idx[int(idx)]
+
+    def _row_weekday(idx: int) -> int:
+        return row_weekday_by_idx[int(idx)]
+
+    def _assigned_names(idx: int) -> list[str]:
+        row_idx = int(idx)
+        cell = str(roster.at[row_idx, "Assigned"] or "")
+        cached = assigned_names_cache.get(row_idx)
+        if cached is not None and cached[0] == cell:
+            return list(cached[1])
+        names = tuple(_name_list(cell))
+        assigned_names_cache[row_idx] = (cell, names)
+        return list(names)
+
+    def _resident_night_signature() -> tuple[tuple[int, str], ...]:
+        return tuple(
+            (idx, str(roster.at[idx, "Assigned"] or ""))
+            for idx in resident_night_row_indexes
+        )
+
+    resident_repair_noop_signatures: dict[str, tuple[tuple[int, str], ...]] = {}
+
+    def _repair_noop_cached(label: str) -> bool:
+        return resident_repair_noop_signatures.get(label) == _resident_night_signature()
+
+    def _remember_repair_noop(label: str) -> None:
+        resident_repair_noop_signatures[label] = _resident_night_signature()
+
+    def _forget_repair_noops() -> None:
+        resident_repair_noop_signatures.clear()
+
+    def _can_worker_take_shift(
+        name: str,
+        shift_type: str,
+        shift_date: date,
+        *,
+        last_night_map: Dict[str, date] | None = None,
+    ) -> bool:
+        if name not in worker_names_set:
+            return False
+        if eligibility_reason(name, shift_date.isoformat(), shift_type) is not None:
+            return False
+
+        last_night_map = last_night_map or {}
+        if shift_type in RESIDENT_NIGHT_SHIFTS:
+            tomorrow_iso = (shift_date + timedelta(days=1)).isoformat()
+            tomorrow_clinics = clinic_lut.get((name, _el.weekday_letter(tomorrow_iso)), set())
+            if tomorrow_clinics:
+                return False
+
+            tomorrow = daily_assignments.get(shift_date + timedelta(days=1), {}).get(name, set())
+            if any(s in _el.CLINIC_SHIFTS or s == "מיון" for s in tomorrow):
+                return False
+
+        if shift_date in blocked_next_day.get(name, set()):
+            return False
+
+        if shift_type in RESIDENT_NIGHT_SHIFTS and (shift_date - last_night_map.get(name, date.min)).days < 2:
+            return False
+
+        today_set = daily_assignments.get(shift_date, {}).get(name, set())
+        senior = _is_senior_name(name)
+
+        if name == SHIMON_NAME and shift_type == YOEATZIM_SHIFT and shift_date.weekday() != 4:
+            return False
+
+        if "רוטציה" in today_set and shift_type in _el.DAY_SHIFTS and shift_type != "רוטציה":
+            return False
+        if shift_type == "רוטציה" and today_set.intersection(_el.DAY_SHIFTS - {"רוטציה"}):
+            return False
+        if shift_type in _el.DAY_SHIFTS:
+            incompatible_day = [
+                existing for existing in today_set.intersection(_el.DAY_SHIFTS)
+                if (existing, shift_type) not in DUAL_OK
+            ]
+            if incompatible_day:
+                return False
+
+        if not today_set:
+            return True
+
+        total_after = len(today_set) + 1
+        if len(today_set) == 1:
+            existing = next(iter(today_set))
+            if (existing, shift_type) not in DUAL_OK:
+                return False
+            return senior or total_after <= 2
+
+        if not senior:
+            return False
+        if total_after > 3:
+            return False
+        special = {KONEN_MION_SHIFT, "בכיר מיון"}
+        return total_after <= 2 or shift_type in special or any(s in special for s in today_set)
+
     def _rebuild_night_state_from_roster() -> None:
         blocked_next_day.clear()
         for name, days in base_blocked_next_day.items():
@@ -1078,10 +1199,10 @@ def auto_assign(
         last_night.clear()
         last_night.update(base_last_night)
 
-        for _, row in roster.sort_values("Date").iterrows():
-            d = date.fromisoformat(str(row["Date"]))
+        for idx, row in roster.sort_values("Date").iterrows():
+            d = _row_date(idx)
             shift = str(row["Shift"])
-            for name in _names(str(row.Assigned or "")):
+            for name in _assigned_names(idx):
                 if shift in RESIDENT_NIGHT_SHIFTS:
                     blocked_next_day[name].add(d + timedelta(days=1))
                 if shift in NIGHT_DUTY_SHIFTS:
@@ -1107,10 +1228,10 @@ def auto_assign(
         preferred_night_hits.clear()
         important_preferred_night_hits.clear()
 
-        for _, row in roster.iterrows():
-            d = date.fromisoformat(str(row["Date"]))
+        for idx, row in roster.iterrows():
+            d = _row_date(idx)
             shift = str(row["Shift"])
-            for name in _names(str(row.Assigned or "")):
+            for name in _assigned_names(idx):
                 personal_assignment_counts[(name, shift)] += 1
                 if shift in ("ת.מיון", "ת.מיון 2"):
                     month_counts[name] += 1
@@ -1458,10 +1579,10 @@ def auto_assign(
 
     def _rebuild_daily_assignments_from_roster() -> None:
         daily_assignments.clear()
-        for _, r in roster.iterrows():
-            d = date.fromisoformat(str(r["Date"]))
+        for idx, r in roster.iterrows():
+            d = _row_date(idx)
             shift = str(r["Shift"])
-            for name in _name_list(r["Assigned"]):
+            for name in _assigned_names(idx):
                 daily_assignments[d].setdefault(name, set()).add(shift)
 
     def _last_night_before(target_date: date) -> Dict[str, date]:
@@ -1518,10 +1639,7 @@ def auto_assign(
         roster.at[idx, "Assigned"] = _write_name_list(names)
 
     def _row_index(d: date, shift: str) -> int | None:
-        mask = (roster["Date"] == d.isoformat()) & (roster["Shift"] == shift)
-        if not mask.any():
-            return None
-        return int(roster.index[mask][0])
+        return row_index_by_date_shift.get((d, shift))
 
     def _rotation_counts() -> Counter:
         return Counter(
@@ -2099,12 +2217,10 @@ def auto_assign(
         return sandwiches
 
     def _resident_night_row_index(d: date, name: str) -> int | None:
-        rows = roster[
-            (roster["Date"] == d.isoformat())
-            & (roster["Shift"].isin(["ת.מיון", "ת.מיון 2"]))
-        ]
-        for idx, row in rows.iterrows():
-            if name in _name_list(row.Assigned):
+        for idx in resident_night_row_indexes:
+            if _row_date(idx) != d:
+                continue
+            if name in _assigned_names(idx):
                 return idx
         return None
 
@@ -2114,6 +2230,7 @@ def auto_assign(
         preferred_names: set[str] | None = None,
         reason: str = "resident night repair",
         allow_sandwich: bool = False,
+        protect_total_objective: tuple[int, int] | None = None,
         protect_weekend_objective: tuple[int, int] | None = None,
         protect_weekend_history: int | None = None,
     ) -> bool:
@@ -2130,16 +2247,17 @@ def auto_assign(
         _rebuild_live_counters_from_roster()
         effective_last_night = _last_night_before(shift_date)
 
-        elig = get_eligible_workers(
-            shift_type=shift_type,
-            shift_date=shift_date,
-            blocked_next_day=blocked_next_day,
-            extra_day_off=extra_day_off,
-            daily_assignments=daily_assignments,
-            blocked_reasons=None,
-            last_night=effective_last_night,
-        )
-        elig = [w for w in elig if w not in current and w != old_name]
+        elig = [
+            w for w in all_worker_names
+            if _can_worker_take_shift(
+                w,
+                shift_type,
+                shift_date,
+                last_night_map=effective_last_night,
+            )
+            and w not in current
+            and w != old_name
+        ]
         non_sandwich = [
             w for w in elig
             if _resident_adjacent_night_penalty(w, shift_date, daily_assignments) == 0
@@ -2177,6 +2295,15 @@ def auto_assign(
         _rebuild_night_state_from_roster()
         _rebuild_live_counters_from_roster()
         if (
+            protect_total_objective is not None
+            and _resident_night_total_objective() > protect_total_objective
+        ):
+            roster.at[idx, "Assigned"] = _write_name_list(original)
+            _rebuild_daily_assignments_from_roster()
+            _rebuild_night_state_from_roster()
+            _rebuild_live_counters_from_roster()
+            return False
+        if (
             protect_weekend_objective is not None
             and _resident_weekend_objective() > protect_weekend_objective
         ):
@@ -2201,10 +2328,14 @@ def auto_assign(
         return True
 
     def _repair_resident_sandwiches() -> int:
+        label = "resident_sandwiches"
+        if _repair_noop_cached(label):
+            return 0
         repaired = 0
         for _ in range(10):
             sandwiches = _find_resident_sandwiches()
             if not sandwiches:
+                _remember_repair_noop(label)
                 break
 
             changed = False
@@ -2215,16 +2346,19 @@ def auto_assign(
                         idx,
                         name,
                         reason="resident night sandwich repair",
+                        protect_total_objective=_resident_night_total_objective(),
                         protect_weekend_objective=_resident_weekend_objective(),
                         protect_weekend_history=_resident_weekend_history_load(),
                     ):
                         repaired += 1
                         changed = True
+                        _forget_repair_noops()
                         break
                 if changed:
                     break
 
             if not changed:
+                _remember_repair_noop(label)
                 break
         return repaired
 
@@ -2384,17 +2518,14 @@ def auto_assign(
         _rebuild_live_counters_from_roster()
 
         effective_last_night = _last_night_before(shift_date)
-        candidates = get_eligible_workers(
-            shift_type=shift_type,
-            shift_date=shift_date,
-            blocked_next_day=blocked_next_day,
-            extra_day_off=extra_day_off,
-            daily_assignments=daily_assignments,
-            blocked_reasons=None,
-            last_night=effective_last_night,
-        )
         candidates = [
-            w for w in candidates
+            w for w in all_worker_names
+            if _can_worker_take_shift(
+                w,
+                shift_type,
+                shift_date,
+                last_night_map=effective_last_night,
+            )
             if w not in current
             and w != old_name
             and _resident_adjacent_night_penalty(w, shift_date, daily_assignments) == 0
@@ -2550,26 +2681,20 @@ def auto_assign(
                             a_last_night = _last_night_before(a_date)
                             b_last_night = _last_night_before(b_date)
                             low_can_take_weekend = (
-                                low_name in get_eligible_workers(
-                                    shift_type=a_shift,
-                                    shift_date=a_date,
-                                    blocked_next_day=blocked_next_day,
-                                    extra_day_off=extra_day_off,
-                                    daily_assignments=daily_assignments,
-                                    blocked_reasons=None,
-                                    last_night=a_last_night,
+                                _can_worker_take_shift(
+                                    low_name,
+                                    a_shift,
+                                    a_date,
+                                    last_night_map=a_last_night,
                                 )
                                 and _resident_adjacent_night_penalty(low_name, a_date, daily_assignments) == 0
                             )
                             high_can_take_weekday = (
-                                high_name in get_eligible_workers(
-                                    shift_type=b_shift,
-                                    shift_date=b_date,
-                                    blocked_next_day=blocked_next_day,
-                                    extra_day_off=extra_day_off,
-                                    daily_assignments=daily_assignments,
-                                    blocked_reasons=None,
-                                    last_night=b_last_night,
+                                _can_worker_take_shift(
+                                    high_name,
+                                    b_shift,
+                                    b_date,
+                                    last_night_map=b_last_night,
                                 )
                                 and _resident_adjacent_night_penalty(high_name, b_date, daily_assignments) == 0
                             )
@@ -2680,27 +2805,21 @@ def auto_assign(
 
             effective_last_night = _last_night_before(shift_date)
             a_can_take_b = (
-                name_a in get_eligible_workers(
-                    shift_type="ת.מיון 2",
-                    shift_date=shift_date,
-                    blocked_next_day=blocked_next_day,
-                    extra_day_off=extra_day_off,
-                    daily_assignments=daily_assignments,
-                    blocked_reasons=None,
-                    last_night=effective_last_night,
+                _can_worker_take_shift(
+                    name_a,
+                    "ת.מיון 2",
+                    shift_date,
+                    last_night_map=effective_last_night,
                 )
                 and _resident_adjacent_night_penalty(name_a, shift_date, daily_assignments) == 0
                 and _resident_night_spacing_penalty(name_a, shift_date, effective_last_night) < 100
             )
             b_can_take_a = (
-                name_b in get_eligible_workers(
-                    shift_type="ת.מיון",
-                    shift_date=shift_date,
-                    blocked_next_day=blocked_next_day,
-                    extra_day_off=extra_day_off,
-                    daily_assignments=daily_assignments,
-                    blocked_reasons=None,
-                    last_night=effective_last_night,
+                _can_worker_take_shift(
+                    name_b,
+                    "ת.מיון",
+                    shift_date,
+                    last_night_map=effective_last_night,
                 )
                 and _resident_adjacent_night_penalty(name_b, shift_date, daily_assignments) == 0
                 and _resident_night_spacing_penalty(name_b, shift_date, effective_last_night) < 100
@@ -2746,6 +2865,7 @@ def auto_assign(
         current_sandwiches = len(_find_resident_sandwiches())
         rolling_weekend_counts = _rolling_resident_weekend_counts(pool)
         current_weekend_counts = Counter({name: weekend_night_counts[name] for name in pool})
+        current_total_counts = _current_resident_total_counts(pool)
         current_weekend = _count_spread_and_square(current_weekend_counts, pool)
         rolling_weekend = _count_spread_and_square(rolling_weekend_counts, pool)
         current_weekend_history = _resident_weekend_history_load(pool)
@@ -2762,6 +2882,7 @@ def auto_assign(
         rows["_weekday"] = rows["Date"].map(lambda x: date.fromisoformat(str(x)).weekday())
         weekend_rows = rows[rows["_weekday"].isin([4, 5])]
         weekday_rows = rows[~rows["_weekday"].isin([4, 5])]
+        direct_candidates: list[tuple[int, int, int, int, str, int, str, str]] = []
         candidates: list[tuple[int, int, int, int, int, str, int, int, str, str]] = []
 
         for a_idx, a_row in weekend_rows.iterrows():
@@ -2774,6 +2895,27 @@ def auto_assign(
                     continue
                 if (a_date, a_shift, high_name) in fixed_assignment_keys:
                     continue
+                for low_name in sorted(pool):
+                    if low_name == high_name:
+                        continue
+                    if weekend_night_counts[low_name] != min_weekend:
+                        continue
+                    if low_name in _name_list(a_row.Assigned):
+                        continue
+                    if current_total_counts[high_name] < current_total_counts[low_name]:
+                        continue
+                    if eligibility_reason(low_name, a_date.isoformat(), a_shift) is not None:
+                        continue
+                    direct_candidates.append((
+                        weekend_night_counts[high_name] - weekend_night_counts[low_name],
+                        _preferred_night_removal_penalty(high_name, a_shift, a_date),
+                        current_total_counts[high_name] - current_total_counts[low_name],
+                        _rolling_resident_night_count(low_name),
+                        a_date.isoformat(),
+                        a_idx,
+                        high_name,
+                        low_name,
+                    ))
                 for b_idx, b_row in weekday_rows.iterrows():
                     b_date = date.fromisoformat(str(b_row.Date))
                     b_shift = str(b_row.Shift)
@@ -2814,6 +2956,73 @@ def auto_assign(
                             low_name,
                         ))
 
+        for _, _, _, _, _, a_idx, high_name, low_name in sorted(
+            direct_candidates,
+            key=lambda item: (item[1], -item[0], -item[2], item[3], item[4]),
+        ):
+            a_row = roster.loc[a_idx]
+            a_date = date.fromisoformat(str(a_row.Date))
+            a_shift = str(a_row.Shift)
+            original_a = _name_list(roster.at[a_idx, "Assigned"])
+            if high_name not in original_a or low_name in original_a:
+                continue
+            current_a = [name for name in original_a if name != high_name]
+
+            roster.at[a_idx, "Assigned"] = _write_name_list(current_a)
+            _rebuild_daily_assignments_from_roster()
+            _rebuild_night_state_from_roster()
+            _rebuild_live_counters_from_roster()
+
+            a_last_night = _last_night_before(a_date)
+            low_can_take_weekend = (
+                _can_worker_take_shift(
+                    low_name,
+                    a_shift,
+                    a_date,
+                    last_night_map=a_last_night,
+                )
+                and _resident_adjacent_night_penalty(low_name, a_date, daily_assignments) == 0
+            )
+            if low_can_take_weekend:
+                roster.at[a_idx, "Assigned"] = _write_name_list(current_a + [low_name])
+                _rebuild_daily_assignments_from_roster()
+                _rebuild_night_state_from_roster()
+                _rebuild_live_counters_from_roster()
+                new_objective = _resident_night_objective()
+                new_weekend = _count_spread_and_square(
+                    Counter({name: weekend_night_counts[name] for name in pool}),
+                    pool,
+                )
+                new_rolling_weekend = _count_spread_and_square(_rolling_resident_weekend_counts(pool), pool)
+                new_sandwiches = len(_find_resident_sandwiches())
+                sandwich_cost_ok = (
+                    new_sandwiches <= current_sandwiches
+                    or (
+                        current_weekend[0] >= 2
+                        and new_weekend[0] < current_weekend[0]
+                        and new_sandwiches <= current_sandwiches + 1
+                    )
+                )
+                if (
+                    (
+                        new_weekend < current_weekend
+                        or new_rolling_weekend < rolling_weekend
+                    )
+                    and _resident_night_total_objective() <= current_total
+                    and sandwich_cost_ok
+                ):
+                    logger.info(
+                        "resident direct weekend balance transfer: %s %s %s -> %s objective %s -> %s",
+                        a_date.isoformat(), a_shift, high_name, low_name,
+                        current_objective, new_objective,
+                    )
+                    return True
+
+            roster.at[a_idx, "Assigned"] = _write_name_list(original_a)
+            _rebuild_daily_assignments_from_roster()
+            _rebuild_night_state_from_roster()
+            _rebuild_live_counters_from_roster()
+
         for _, _, _, _, _, _, a_idx, b_idx, high_name, low_name in sorted(
             candidates,
             key=lambda item: (item[1], -item[0], item[2], item[3], item[4], item[5]),
@@ -2838,26 +3047,20 @@ def auto_assign(
             a_last_night = _last_night_before(a_date)
             b_last_night = _last_night_before(b_date)
             low_can_take_weekend = (
-                low_name in get_eligible_workers(
-                    shift_type=a_shift,
-                    shift_date=a_date,
-                    blocked_next_day=blocked_next_day,
-                    extra_day_off=extra_day_off,
-                    daily_assignments=daily_assignments,
-                    blocked_reasons=None,
-                    last_night=a_last_night,
+                _can_worker_take_shift(
+                    low_name,
+                    a_shift,
+                    a_date,
+                    last_night_map=a_last_night,
                 )
                 and _resident_adjacent_night_penalty(low_name, a_date, daily_assignments) == 0
             )
             high_can_take_weekday = (
-                high_name in get_eligible_workers(
-                    shift_type=b_shift,
-                    shift_date=b_date,
-                    blocked_next_day=blocked_next_day,
-                    extra_day_off=extra_day_off,
-                    daily_assignments=daily_assignments,
-                    blocked_reasons=None,
-                    last_night=b_last_night,
+                _can_worker_take_shift(
+                    high_name,
+                    b_shift,
+                    b_date,
+                    last_night_map=b_last_night,
                 )
                 and _resident_adjacent_night_penalty(high_name, b_date, daily_assignments) == 0
             )
@@ -2985,27 +3188,21 @@ def auto_assign(
             a_last_night = _last_night_before(a_date)
             b_last_night = _last_night_before(b_date)
             b_can_take_a = (
-                name_b in get_eligible_workers(
-                    shift_type=a_shift,
-                    shift_date=a_date,
-                    blocked_next_day=blocked_next_day,
-                    extra_day_off=extra_day_off,
-                    daily_assignments=daily_assignments,
-                    blocked_reasons=None,
-                    last_night=a_last_night,
+                _can_worker_take_shift(
+                    name_b,
+                    a_shift,
+                    a_date,
+                    last_night_map=a_last_night,
                 )
                 and _resident_adjacent_night_penalty(name_b, a_date, daily_assignments) == 0
                 and _resident_night_spacing_penalty(name_b, a_date, a_last_night) < 100
             )
             a_can_take_b = (
-                name_a in get_eligible_workers(
-                    shift_type=b_shift,
-                    shift_date=b_date,
-                    blocked_next_day=blocked_next_day,
-                    extra_day_off=extra_day_off,
-                    daily_assignments=daily_assignments,
-                    blocked_reasons=None,
-                    last_night=b_last_night,
+                _can_worker_take_shift(
+                    name_a,
+                    b_shift,
+                    b_date,
+                    last_night_map=b_last_night,
                 )
                 and _resident_adjacent_night_penalty(name_a, b_date, daily_assignments) == 0
                 and _resident_night_spacing_penalty(name_a, b_date, b_last_night) < 100
@@ -3109,27 +3306,21 @@ def auto_assign(
                         pref_last_night = _last_night_before(pref_date)
                         donor_last_night = _last_night_before(donor_date)
                         name_can_take_preferred = (
-                            name in get_eligible_workers(
-                                shift_type=pref_shift,
-                                shift_date=pref_date,
-                                blocked_next_day=blocked_next_day,
-                                extra_day_off=extra_day_off,
-                                daily_assignments=daily_assignments,
-                                blocked_reasons=None,
-                                last_night=pref_last_night,
+                            _can_worker_take_shift(
+                                name,
+                                pref_shift,
+                                pref_date,
+                                last_night_map=pref_last_night,
                             )
                             and _resident_adjacent_night_penalty(name, pref_date, daily_assignments) == 0
                             and _resident_night_spacing_penalty(name, pref_date, pref_last_night) < 100
                         )
                         displaced_can_take_donor = (
-                            displaced in get_eligible_workers(
-                                shift_type=donor_shift,
-                                shift_date=donor_date,
-                                blocked_next_day=blocked_next_day,
-                                extra_day_off=extra_day_off,
-                                daily_assignments=daily_assignments,
-                                blocked_reasons=None,
-                                last_night=donor_last_night,
+                            _can_worker_take_shift(
+                                displaced,
+                                donor_shift,
+                                donor_date,
+                                last_night_map=donor_last_night,
                             )
                             and _resident_adjacent_night_penalty(displaced, donor_date, daily_assignments) == 0
                             and _resident_night_spacing_penalty(displaced, donor_date, donor_last_night) < 100
@@ -3168,6 +3359,9 @@ def auto_assign(
         return False
 
     def _optimize_resident_night_assignments(max_steps: int = 8) -> int:
+        label = "resident_night_assignment_optimization"
+        if _repair_noop_cached(label):
+            return 0
         improved = 0
         for _ in range(max_steps):
             if (
@@ -3176,16 +3370,23 @@ def auto_assign(
                 or _try_cross_date_resident_night_type_swap()
             ):
                 improved += 1
+                _forget_repair_noops()
             else:
+                _remember_repair_noop(label)
                 break
         return improved
 
     def _repair_resident_weekend_balance(max_steps: int = 24) -> int:
+        label = "resident_weekend_balance"
+        if _repair_noop_cached(label):
+            return 0
         repaired = 0
         for _ in range(max_steps):
             if not _try_resident_weekend_swap():
+                _remember_repair_noop(label)
                 break
             repaired += 1
+            _forget_repair_noops()
         return repaired
 
     def _try_resident_rolling_total_swap() -> bool:
@@ -3265,11 +3466,16 @@ def auto_assign(
         return False
 
     def _repair_resident_rolling_total_balance(max_steps: int = 20) -> int:
+        label = "resident_rolling_total_balance"
+        if _repair_noop_cached(label):
+            return 0
         repaired = 0
         for _ in range(max_steps):
             if not _try_resident_rolling_total_swap():
+                _remember_repair_noop(label)
                 break
             repaired += 1
+            _forget_repair_noops()
         return repaired
 
     def _try_resident_thursday_swap() -> bool:
@@ -3344,26 +3550,20 @@ def auto_assign(
             a_last_night = _last_night_before(a_date)
             b_last_night = _last_night_before(b_date)
             low_can_take_thursday = (
-                low_name in get_eligible_workers(
-                    shift_type=a_shift,
-                    shift_date=a_date,
-                    blocked_next_day=blocked_next_day,
-                    extra_day_off=extra_day_off,
-                    daily_assignments=daily_assignments,
-                    blocked_reasons=None,
-                    last_night=a_last_night,
+                _can_worker_take_shift(
+                    low_name,
+                    a_shift,
+                    a_date,
+                    last_night_map=a_last_night,
                 )
                 and _resident_adjacent_night_penalty(low_name, a_date, daily_assignments) == 0
             )
             high_can_take_other = (
-                high_name in get_eligible_workers(
-                    shift_type=b_shift,
-                    shift_date=b_date,
-                    blocked_next_day=blocked_next_day,
-                    extra_day_off=extra_day_off,
-                    daily_assignments=daily_assignments,
-                    blocked_reasons=None,
-                    last_night=b_last_night,
+                _can_worker_take_shift(
+                    high_name,
+                    b_shift,
+                    b_date,
+                    last_night_map=b_last_night,
                 )
                 and _resident_adjacent_night_penalty(high_name, b_date, daily_assignments) == 0
             )
@@ -3388,11 +3588,16 @@ def auto_assign(
         return False
 
     def _repair_resident_thursday_balance(max_steps: int = 3) -> int:
+        label = "resident_thursday_balance"
+        if _repair_noop_cached(label):
+            return 0
         repaired = 0
         for _ in range(max_steps):
             if not _try_resident_thursday_swap():
+                _remember_repair_noop(label)
                 break
             repaired += 1
+            _forget_repair_noops()
         return repaired
 
     def _repair_resident_night_fairness(
@@ -3402,6 +3607,7 @@ def auto_assign(
         type_steps: int = 2,
         thursday_steps: int = 3,
     ) -> int:
+        _forget_repair_noops()
         repaired = 0
         for _ in range(rounds):
             before = repaired
@@ -3416,6 +3622,8 @@ def auto_assign(
             repaired += _repair_resident_thursday_balance(max_steps=thursday_steps)
             if repaired == before:
                 break
+        if _resident_night_total_objective()[0] > 1:
+            repaired += _repair_resident_night_balance()
         return repaired
 
     def _senior_other_friday_day_dates(name: str, d: date) -> set[date]:
@@ -3638,23 +3846,17 @@ def auto_assign(
             _rebuild_night_state_from_roster()
             _rebuild_live_counters_from_roster()
 
-            low_can_take_friday = low_name in get_eligible_workers(
-                shift_type=a_shift,
-                shift_date=a_date,
-                blocked_next_day=blocked_next_day,
-                extra_day_off=extra_day_off,
-                daily_assignments=daily_assignments,
-                blocked_reasons=None,
-                last_night=_last_night_before(a_date),
+            low_can_take_friday = _can_worker_take_shift(
+                low_name,
+                a_shift,
+                a_date,
+                last_night_map=_last_night_before(a_date),
             )
-            high_can_take_other = high_name in get_eligible_workers(
-                shift_type=b_shift,
-                shift_date=b_date,
-                blocked_next_day=blocked_next_day,
-                extra_day_off=extra_day_off,
-                daily_assignments=daily_assignments,
-                blocked_reasons=None,
-                last_night=_last_night_before(b_date),
+            high_can_take_other = _can_worker_take_shift(
+                high_name,
+                b_shift,
+                b_date,
+                last_night_map=_last_night_before(b_date),
             )
 
             if low_can_take_friday and high_can_take_other:
@@ -3688,19 +3890,25 @@ def auto_assign(
         return repaired
 
     def _repair_resident_night_balance() -> int:
+        label = "resident_night_balance"
+        if _repair_noop_cached(label):
+            return 0
         repaired = 0
         seen_states: set[tuple[tuple[str, int], ...]] = set()
         for _ in range(20):
             counts = _resident_night_total_counts()
             if not counts:
+                _remember_repair_noop(label)
                 break
             state = tuple(sorted(counts.items()))
             if state in seen_states:
+                _remember_repair_noop(label)
                 break
             seen_states.add(state)
             max_count = max(counts.values())
             min_count = min(counts.values())
             if max_count - min_count <= 1:
+                _remember_repair_noop(label)
                 break
 
             high_names = [name for name, count in counts.items() if count == max_count]
@@ -3729,6 +3937,7 @@ def auto_assign(
                         if after_objective < before_objective:
                             repaired += 1
                             changed = True
+                            _forget_repair_noops()
                             break
                         roster["Assigned"] = assigned_snapshot
                         _rebuild_daily_assignments_from_roster()
@@ -3738,6 +3947,11 @@ def auto_assign(
                     break
 
             if not changed:
+                if _try_best_resident_night_improvement():
+                    repaired += 1
+                    _forget_repair_noops()
+                    continue
+                _remember_repair_noop(label)
                 break
         return repaired
 
@@ -4736,7 +4950,7 @@ def auto_assign(
     # Cleanup/refill/coupling can move the roster away from the best resident-night
     # balance. Run the resident repairs again on the final shape so obvious legal
     # weekend swaps are not lost late in the pipeline.
-    report_progress(89, "מאזן תורנויות אחרי ניקוי")
+    report_progress(89, "מאזן תורנויות אחרי ניקוי (כולל חמישי)")
     post_cleanup_resident_fairness = _repair_resident_night_fairness(
         rounds=3,
         weekend_steps=32,
@@ -4745,7 +4959,7 @@ def auto_assign(
     )
     if post_cleanup_resident_fairness:
         logger.info("Post-cleanup resident night fairness repair changed %d assignments", post_cleanup_resident_fairness)
-    report_progress(92, "מאזן חמישי ושישי אחרי ניקוי")
+    report_progress(92, "מצמיד ומאזן ימי שישי")
     final_friday_pairings = _repair_friday_pairings()
     if final_friday_pairings:
         logger.info("Post-cleanup Friday duty/day pairing repair changed %d assignments", final_friday_pairings)
@@ -4780,6 +4994,7 @@ def auto_assign(
     final_post_consult_friday_pairings = _repair_friday_pairings()
     if final_post_consult_friday_pairings:
         logger.info("Post-consult Friday duty/day pairing repair changed %d assignments", final_post_consult_friday_pairings)
+    report_progress(96, "מאזן תורנויות סופי (כולל חמישי)")
     final_last_resident_fairness = _repair_resident_night_fairness(
         rounds=3,
         weekend_steps=32,
