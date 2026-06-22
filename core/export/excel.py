@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import List, Dict, Sequence, Iterable
+import re
 
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter, range_boundaries
@@ -19,7 +20,11 @@ from openpyxl.worksheet.formula import ArrayFormula
 
 from core.elig_utils import workers_df, unavail_lookup   # auto-build of unassigned lists
 from core.data import backend_tables
-from core.holiday_utils import holiday_names_from_tables
+from core.holiday_utils import (
+    holiday_display_names_from_tables,
+    holiday_eve_names_from_tables,
+    holiday_names_from_tables,
+)
 import pandas as pd
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -95,9 +100,21 @@ def _week_range(sunday: date) -> List[date]:
 def _names(cell: str) -> Iterable[str]:
     """Split an 'Assigned' cell into clean names (skip warnings / ‘-’)."""
     for n in cell.split(","):
-        n = n.strip()
-        if n and not n.startswith("⚠️") and n != "-":
-            yield n
+        n = n.replace("\u200f", "").replace("\u200e", "").replace("\xa0", " ").strip()
+        if not n or n == "-":
+            continue
+        if n.startswith("\u26a0"):
+            stripped = re.sub(r"^\u26a0\ufe0f?\s*\d+\s*/\s*\d+\s*", "", n).strip(" ,")
+            if not stripped or stripped == n:
+                continue
+            n = stripped
+        if "לבחור" in n and "חלופי" in n:
+            continue
+        if n.lower().startswith("needs manual pick"):
+            continue
+        if re.fullmatch(r"\d+\s*/\s*\d+", n):
+            continue
+        yield n
 
 def _auto_unassigned(roster: pd.DataFrame) -> Dict[str, List[str]]:
     """Compute un-assigned names per ISO-date (names only)."""
@@ -148,18 +165,32 @@ def _merge_names(existing: str, extra: Sequence[str]) -> str:
     cur.update(n for n in extra if n.strip())
     return ", ".join(sorted(cur)) if cur else "-"
 
-def _holiday_label(d: date, holiday_names: Dict[date, str]) -> str:
-    if d in holiday_names:
-        return holiday_names[d]
+def _holiday_label(
+    d: date,
+    holiday_names: Dict[date, str],
+    holiday_eve_names: Dict[date, str] | None = None,
+    holiday_display_names: Dict[date, str] | None = None,
+) -> str:
+    holiday_eve_names = holiday_eve_names or {}
+    display_names = holiday_display_names or holiday_names
+    if d in display_names:
+        return display_names[d]
+    if d in holiday_eve_names:
+        return holiday_eve_names[d]
     next_name = holiday_names.get(d + timedelta(days=1))
     if next_name:
         return f"ערב {next_name}"
     return ""
 
-def _weekday_header(d: date, holiday_names: Dict[date, str]) -> str:
-    label = _holiday_label(d, holiday_names)
+def _weekday_header(
+    d: date,
+    holiday_names: Dict[date, str],
+    holiday_eve_names: Dict[date, str] | None = None,
+    holiday_display_names: Dict[date, str] | None = None,
+) -> str:
+    label = _holiday_label(d, holiday_names, holiday_eve_names, holiday_display_names)
     weekday = _WEEKDAY_LETTERS[d.weekday()]
-    return f"{weekday}\n{label}" if label else weekday
+    return f"{weekday} ({label})" if label else weekday
 
 def _pivot_for_days(
     roster: pd.DataFrame,
@@ -215,14 +246,21 @@ def _build_calendar_df(
     seven_dates: List[date],
     unassigned: Dict[str, Sequence[str | tuple[str, str]]] | None = None,
     holiday_names: Dict[date, str] | None = None,
+    holiday_eve_names: Dict[date, str] | None = None,
+    holiday_display_names: Dict[date, str] | None = None,
 ) -> pd.DataFrame:
     """Return DF = 2-row header + body + optional ‘un-assigned’ row."""
     holiday_names = holiday_names or {}
+    holiday_eve_names = holiday_eve_names or {}
+    holiday_display_names = holiday_display_names or holiday_names
     date_cols = [d.strftime("%d/%m/%Y") for d in seven_dates]
     cols      = ["תפקיד"] + date_cols
 
     # Weekday first (bolded top row) then date row
-    hdr1 = [""] + [_weekday_header(d, holiday_names) for d in seven_dates]
+    hdr1 = [""] + [
+        _weekday_header(d, holiday_names, holiday_eve_names, holiday_display_names)
+        for d in seven_dates
+    ]
     hdr2 = ["תפקיד"] + date_cols
 
     header = pd.DataFrame([hdr1, hdr2], columns=cols)
@@ -294,9 +332,11 @@ def _write_block(
     seven_dates: List[date],
     grey_cols: Sequence[int] = (),
     holiday_names: Dict[date, str] | None = None,
+    holiday_eve_names: Dict[date, str] | None = None,
 ) -> int:
     """Write *df_block* (top-left at A<start_row>) – return next free row."""
     holiday_names = holiday_names or {}
+    holiday_eve_names = holiday_eve_names or {}
     n_rows, n_cols = df_block.shape
 
     # write values
@@ -308,7 +348,7 @@ def _write_block(
     highlight = [
         1 + i
         for i, d in enumerate(seven_dates, start=1)
-        if d.weekday() in (4, 5) or (d + timedelta(days=1)) in holiday_names
+        if d.weekday() in (4, 5) or d in holiday_eve_names or (d + timedelta(days=1)) in holiday_names
     ]
     holiday_cols = [
         1 + i
@@ -434,6 +474,39 @@ def _ensure_xlsm_name(month: str, fname: str | None) -> str:
     if p.suffix.lower() != ".xlsm":
         return f"{p.stem}.xlsm"
     return p.name
+
+
+def _previous_month_night_assignments(month: str) -> Dict[str, str]:
+    try:
+        yr, mon = map(int, month.split("-"))
+        prev_day = date(yr, mon, 1) - timedelta(days=1)
+        hist = backend_tables().get("history")
+        if hist is None or hist.empty or not {"Date", "Name", "Shift"}.issubset(hist.columns):
+            return {}
+
+        dates = pd.to_datetime(hist["Date"], format="mixed", dayfirst=True, errors="coerce").dt.date
+        rows = hist[
+            (dates == prev_day)
+            & (hist["Shift"].astype(str).str.strip().isin(["ת.מיון", "ת.מיון 2"]))
+        ]
+        by_shift: Dict[str, list[str]] = {"ת.מיון": [], "ת.מיון 2": []}
+        for _, row in rows.iterrows():
+            shift = str(row["Shift"]).strip()
+            name = str(row["Name"]).strip()
+            if shift in by_shift and name and name not in by_shift[shift]:
+                by_shift[shift].append(name)
+        return {shift: ", ".join(names) for shift, names in by_shift.items() if names}
+    except Exception:
+        return {}
+
+
+def _previous_month_after_duty_text(month: str) -> str:
+    names: list[str] = []
+    for text in _previous_month_night_assignments(month).values():
+        for name in _names(text):
+            if name not in names:
+                names.append(name)
+    return ", ".join(names)
 
 _FRIDAY_TOKEN_WIDTH = 99
 _FRIDAY_MAX_NAMES_PER_SOURCE = 4
@@ -585,12 +658,14 @@ def _set_unassigned_formula_row(
     seven_dates: Sequence[date],
     mon: int,
     holiday_names: Dict[date, str] | None = None,
+    holiday_eve_names: Dict[date, str] | None = None,
 ) -> None:
     """
     Write the Excel formula row for '⚠️ לא שובצו' under one weekly block.
     """
     row_num = block_start + 2 + len(SHIFT_ORDER)
     holiday_names = holiday_names or {}
+    holiday_eve_names = holiday_eve_names or {}
 
     thin = Side(style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -630,13 +705,9 @@ def _set_unassigned_formula_row(
             f')'
         )
 
-        # 1. Get the cell
         cell = ws.cell(row_num, col)
-        
-        # 2. Inject as an ArrayFormula to prevent the @ symbol bug
         cell.value = ArrayFormula(ref, formula)
 
-        # 3. Apply your styling
         cell.alignment = Alignment(
             horizontal="right",
             vertical="top",
@@ -651,7 +722,7 @@ def _set_unassigned_formula_row(
             cell.fill = _BLUE
         elif d.weekday() in (4, 5):
             cell.fill = _ORANGE
-        elif d + timedelta(days=1) in holiday_names:
+        elif d in holiday_eve_names or d + timedelta(days=1) in holiday_names:
             cell.fill = _ORANGE
 
 def _summary_names() -> List[str]:
@@ -879,6 +950,8 @@ def _build_sheet_toranut(
     roster_df: pd.DataFrame,
     holidays: Sequence[date] = (),
     holidays_named: Dict[date, str] | None = None,
+    holiday_eve_names: Dict[date, str] | None = None,
+    holidays_display_named: Dict[date, str] | None = None,
     nights_off_by_date: Dict[str, Sequence[str]] | None = None,
 ):
     """
@@ -945,6 +1018,8 @@ def _build_sheet_toranut(
     thick = Side(style="medium", color="000000")
     holidays = set(holidays)
     holidays_named = holidays_named or {}
+    holiday_eve_names = holiday_eve_names or {}
+    holidays_display_named = holidays_display_named or holidays_named
 
     first = date(year, mon, 1)
     cur = first
@@ -954,9 +1029,9 @@ def _build_sheet_toranut(
 
         ws.cell(row_ptr, 2, cur.strftime("%d/%m/%Y"))                               # B תאריך
         day_label = _WEEKDAY_LETTERS[cur.weekday()]
-        holiday_label = _holiday_label(cur, holidays_named)
+        holiday_label = _holiday_label(cur, holidays_named, holiday_eve_names, holidays_display_named)
         if holiday_label:
-            day_label = f"{day_label} - {holiday_label}"
+            day_label = f"{day_label} ({holiday_label})"
 
         ws.cell(row_ptr, 3, day_label)                                              # C יום
         ws.cell(row_ptr, 4, assigned_by_date_shift.get((d_iso, "ת.מיון"), ""))  # D
@@ -997,7 +1072,7 @@ def _build_sheet_toranut(
             if d:
                 if d in holidays:
                     cell.fill = _BLUE
-                elif d.weekday() == 4 or (d + timedelta(days=1)) in holidays:
+                elif d.weekday() == 4 or d in holiday_eve_names or (d + timedelta(days=1)) in holidays:
                     cell.fill = ORANGE
                 elif d.weekday() == 5:
                     cell.fill = YELLOW
@@ -1035,7 +1110,7 @@ def _build_sheet_toranut(
         if d:
             if d in holidays:
                 cell.fill = _BLUE
-            elif d.weekday() == 4 or (d + timedelta(days=1)) in holidays:
+            elif d.weekday() == 4 or d in holiday_eve_names or (d + timedelta(days=1)) in holidays:
                 cell.fill = ORANGE
             elif d.weekday() == 5:
                 cell.fill = YELLOW
@@ -1222,6 +1297,8 @@ def _build_sheet_yoatzim(
     month: str,
     holidays: Sequence[date] = (),                  # תאריכי חופש (חג)
     holidays_named: Dict[date, str] | None = None,  # אופציונלי: שם החג לכל תאריך
+    holiday_eve_names: Dict[date, str] | None = None,
+    holidays_display_named: Dict[date, str] | None = None,
     main_ref_by_date: Dict[str, str] | None = None  # NEW: date_iso -> "'YYYY-MM'!C$10"
 ):
     """
@@ -1270,6 +1347,8 @@ def _build_sheet_yoatzim(
 
     holidays_set = set(holidays or [])
     name_map = holidays_named or {}
+    holiday_eve_names = holiday_eve_names or {}
+    display_name_map = holidays_display_named or name_map
 
     for _, row in subset.iterrows():
         d_iso = str(row["Date"])  # "YYYY-MM-DD"
@@ -1277,11 +1356,8 @@ def _build_sheet_yoatzim(
         weekday_full = _WEEKDAY_FULL[d.weekday()]
 
         # תיוג ערב חג/חג בטור "יום"
-        label = ""
-        if d in holidays_set:
-            label = f" ({name_map.get(d, 'חג')})"
-        elif (d + timedelta(days=1)) in holidays_set:
-            label = " (ערב חג)"
+        label = _holiday_label(d, name_map, holiday_eve_names, display_name_map)
+        label = f" ({label})" if label else ""
         day_text = f"{weekday_full}{label}"
 
         ws.cell(r, 3, d.strftime("%d/%m/%Y"))  # תאריך
@@ -1307,7 +1383,7 @@ def _build_sheet_yoatzim(
         # צבעים: כחול גובר על כתום
         if d in holidays_set:
             fill = _BLUE
-        elif (d + timedelta(days=1)) in holidays_set:
+        elif d in holiday_eve_names or (d + timedelta(days=1)) in holidays_set:
             fill = _ORANGE
         elif d.weekday() in (4, 5):  # Fri/Sat
             fill = _ORANGE
@@ -1396,7 +1472,10 @@ def export_month_to_xlsx(
     if days_off_by_date is None:
         days_off_by_date = _auto_days_off()
     nights_off_by_date = _auto_nights_off()
-    holiday_names = holiday_names_from_tables(backend_tables())
+    tables = backend_tables()
+    holiday_names = holiday_names_from_tables(tables)
+    holiday_eve_names = holiday_eve_names_from_tables(tables)
+    holiday_display_names = holiday_display_names_from_tables(tables)
     holidays = set(holiday_names)
 
     yr, mon = map(int, month.split("-"))
@@ -1442,6 +1521,7 @@ def export_month_to_xlsx(
     yoatz_ref_by_date: Dict[str, str] = {}
     toren_mion_ref_by_date: Dict[str, str] = {}
     toren_machlaka_ref_by_date: Dict[str, str] = {}
+    night_cell_pos_by_date_shift: Dict[tuple[str, str], tuple[int, int]] = {}
     after_cell_pos_by_date: Dict[str, tuple[int, int]] = {}
     friday_refs_by_date: Dict[str, List[str]] = {}
     month_summary_refs: Dict[str, List[str]] = {
@@ -1468,6 +1548,7 @@ def export_month_to_xlsx(
         "חופש": 2 + SHIFT_ORDER.index("חופש"),
         "רוטציה": 2 + SHIFT_ORDER.index("רוטציה"),
     }
+    sun_thu_summary_metrics = {"ייעוצים", "חופש", "רוטציה"}
     friday_row_offsets = {
         shift: 2 + SHIFT_ORDER.index(shift)
         for shift in FRIDAY_LINK_SHIFTS
@@ -1492,10 +1573,12 @@ def export_month_to_xlsx(
             yoatz_ref_by_date[d_iso] = f"'{month}'!{col_letter}${yoatz_row}"
             toren_mion_ref_by_date[d_iso] = f"'{month}'!{col_letter}${tmion_row}"
             toren_machlaka_ref_by_date[d_iso] = f"'{month}'!{col_letter}${tmach_row}"
+            night_cell_pos_by_date_shift[(d_iso, "ת.מיון")] = (tmion_row, col)
+            night_cell_pos_by_date_shift[(d_iso, "ת.מיון 2")] = (tmach_row, col)
             after_cell_pos_by_date[d_iso] = (after_row, col)
             if dte.month == mon:
                 for metric, row_off in summary_shift_row_offsets.items():
-                    if metric == "חופש" and dte.weekday() not in (6, 0, 1, 2, 3):
+                    if metric in sun_thu_summary_metrics and dte.weekday() not in (6, 0, 1, 2, 3):
                         continue
                     month_summary_refs[metric].append(
                         f"'{month}'!{col_letter}${block_start + row_off}"
@@ -1524,7 +1607,13 @@ def export_month_to_xlsx(
             days_off_by_date=days_off_by_date,
         )
 
-        block_df = _build_calendar_df(pivot, seven, holiday_names=holiday_names)
+        block_df = _build_calendar_df(
+            pivot,
+            seven,
+            holiday_names=holiday_names,
+            holiday_eve_names=holiday_eve_names,
+            holiday_display_names=holiday_display_names,
+        )
 
         grey_cols = [1 + i for i, d in enumerate(seven, start=1) if d.month != mon]
 
@@ -1535,6 +1624,7 @@ def export_month_to_xlsx(
             seven,
             grey_cols=grey_cols,
             holiday_names=holiday_names,
+            holiday_eve_names=holiday_eve_names,
         )
 
         # Reinsert the Excel formula row for 'לא שובצו'
@@ -1543,6 +1633,8 @@ def export_month_to_xlsx(
             block_start=block_start,
             seven_dates=seven,
             mon=mon,
+            holiday_names=holiday_names,
+            holiday_eve_names=holiday_eve_names,
         )
 
         # Rebuild lookup formulas on the main month sheet after the block was written
@@ -1562,6 +1654,13 @@ def export_month_to_xlsx(
     # ----------------------------------------------------------
     def _blank_if_dash_or_empty(ref: str) -> str:
         return f'IF(OR({ref}="-",{ref}=""),"",{ref})'
+
+    previous_month_nights = _previous_month_night_assignments(month)
+    prev_iso = (first - timedelta(days=1)).isoformat()
+    for shift, text in previous_month_nights.items():
+        pos = night_cell_pos_by_date_shift.get((prev_iso, shift))
+        if pos and text:
+            ws.cell(pos[0], pos[1]).value = text
 
     for d_iso, (r, c) in after_cell_pos_by_date.items():
         if not d_iso.startswith(month):
@@ -1610,6 +1709,8 @@ def export_month_to_xlsx(
         roster_df,
         holidays=holidays,
         holidays_named=holiday_names,
+        holiday_eve_names=holiday_eve_names,
+        holidays_display_named=holiday_display_names,
         nights_off_by_date=nights_off_by_date,
     )
     _build_sheet_ovdim(ws_ovdim)
@@ -1625,6 +1726,8 @@ def export_month_to_xlsx(
         month,
         holidays=holidays,
         holidays_named=holiday_names,
+        holiday_eve_names=holiday_eve_names,
+        holidays_display_named=holiday_display_names,
         main_ref_by_date=yoatz_ref_by_date,
     )
 

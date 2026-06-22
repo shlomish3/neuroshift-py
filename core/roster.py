@@ -4,7 +4,8 @@ core/roster.py
 
 • Builds the blank roster (one row per calendar-day × shift-type).
 • Injects “Needed”  (hard minimum) and “SoftCap” (upper bound).
-• מרפאת פוסט אשפוז appears only on dates listed in the “פוסט אשפוז” tab.
+• Clinic dates come from יומן מרפאות; כמות נדרשת controls staffing count
+  only on dates where that clinic appears in the clinic calendar.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from typing import List, Set, Dict
 import pandas as pd
 
 from core.data import backend_tables
-from core.holiday_utils import effective_weekday_letter, holiday_names_from_tables
+from core.holiday_utils import effective_weekday_letter, holiday_eve_names_from_tables, holiday_names_from_tables
 
 
 # ──────────────────────────────────────────────────────────────
@@ -36,8 +37,16 @@ NEEDED_DF: pd.DataFrame | None = None
 SHIFT_TYPES: List[str] = []
 POST_DATES: Set[date] = set()
 HOLIDAY_NAMES: Dict[date, str] = {}
+HOLIDAY_EVE_NAMES: Dict[date, str] = {}
 
 HEB_WEEKDAYS: List[str] = ["ב", "ג", "ד", "ה", "ו", "ש", "א"]   # Mon … Sun
+
+
+def _is_calendar_clinic_shift(shift: str) -> bool:
+    return (
+        shift in {"EMG", "נוירולוגיה כללית"}
+        or shift.startswith("מרפאת ")
+    )
 
 
 def _ensure_roster_tables_loaded() -> None:
@@ -46,7 +55,7 @@ def _ensure_roster_tables_loaded() -> None:
 
     This avoids contacting Google during module import.
     """
-    global _tables, NEEDED_DF, SHIFT_TYPES, POST_DATES, HOLIDAY_NAMES
+    global _tables, NEEDED_DF, SHIFT_TYPES, POST_DATES, HOLIDAY_NAMES, HOLIDAY_EVE_NAMES
 
     if _tables is not None:
         return
@@ -64,6 +73,7 @@ def _ensure_roster_tables_loaded() -> None:
         ).dropna().dt.date
     )
     HOLIDAY_NAMES = holiday_names_from_tables(_tables)
+    HOLIDAY_EVE_NAMES = holiday_eve_names_from_tables(_tables)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -100,15 +110,11 @@ def template_for_month(
     rows = []
     for d in (first + timedelta(days=i) for i in range((last - first).days + 1)):
         display_wd = HEB_WEEKDAYS[d.isoweekday() - 1]  # actual Hebrew weekday letter
-        wd = effective_weekday_letter(d, HOLIDAY_NAMES)
+        wd = effective_weekday_letter(d, HOLIDAY_NAMES, HOLIDAY_EVE_NAMES)
 
         for shift in SHIFT_TYPES:
             # ── 1. base 'Needed' from the required-sheet ───────────────
             base_needed = int(NEEDED_DF.loc[shift, wd])
-
-            # פוסט אשפוז only on scheduled dates
-            if shift == "מרפאת פוסט אשפוז" and d not in POST_DATES:
-                base_needed = 0
 
             # ── 2. base SoftCap ────────────────────────────────────────
             if shift == "מחלקה":
@@ -123,12 +129,17 @@ def template_for_month(
             needed = base_needed
             soft_cap = base_soft_cap
 
-            # ── 3. calendar overrides for clinics ─────────────────────
-            if clinic_needs is not None:
-                override = clinic_needs.get((d, shift))
-                if override is not None:
-                    needed = int(override)
-                    soft_cap = max(soft_cap, needed)
+            # ── 3. calendar clinic handling ───────────────────────────
+            if clinic_needs is not None and _is_calendar_clinic_shift(shift):
+                calendar_needed = int(clinic_needs.get((d, shift), 0))
+                if calendar_needed > 0:
+                    # יומן מרפאות decides the date. כמות נדרשת decides how
+                    # many people are needed on that date. Fall back to the
+                    # calendar count only if כמות נדרשת has no value.
+                    needed = base_needed if base_needed > 0 else calendar_needed
+                else:
+                    needed = 0
+                soft_cap = needed
 
             rows.append(
                 {

@@ -45,8 +45,8 @@ PRIORITY_BUCKETS = [
     "מרפאת כאבי ראש", "מרפאת פוסט אשפוז", "מרפאת שבץ מוחי", "מרפאת נוירואונקולוגיה", "נוירולוגיה כללית",
     "EMG",
     "ת.מיון", "ת.מיון 2", "כונן מיון",
-    "מחלקה",
     "מיון",
+    "מחלקה",
     "ייעוצים מובילים",
     "EEG",
 ]
@@ -63,7 +63,7 @@ _DAY_SHIFTS = {
     "מרפאת פוסט אשפוז", "מרפאת שבץ מוחי", "מרפאת נוירואונקולוגיה", "נוירולוגיה כללית",
     # ward / ED / misc.
     "אטנדינג", "מחלקה", "מיון",
-    "ייעוצים מובילים", "מחקר",
+    "ייעוצים מובילים", "מחקר", "רוטציה",
 }
 
 def _both(pairs):
@@ -78,7 +78,10 @@ _day_night_pairs = _both(product(_DAY_SHIFTS, NIGHT_DUTY_SHIFTS))
 _bakir_pairs = _both({("בכיר מיון", s) for s in _DAY_SHIFTS}) ## Removed בכיר מיון entirely
 
 # explicit extra day–day pairs
-_extra_pairs = {("EEG", "מרפאת אפילפסיה גנדלמן"), ("מרפאת אפילפסיה גנדלמן", "EEG")}
+_extra_pairs = {
+    ("EEG ילדים", "מרפאת אפילפסיה גנדלמן"), ("מרפאת אפילפסיה גנדלמן", "EEG ילדים"),
+    ("EEG", "EEG ילדים"), ("EEG ילדים", "EEG"),
+}
 
 DUAL_OK = frozenset(_day_night_pairs | _bakir_pairs | _extra_pairs)
 
@@ -105,10 +108,12 @@ EMAIL_TO_NAME = {
     "aviranpriante93@gmail.com":   "פריאנטה",
     "nirhersh@gmail.com":          "הרש",
     "coheno@shamir.gov.il":        "כהן",
+    "oren.s.cohen@gmail.com":      "כהן",
     "eladhaser7@gmail.com":        "הסר",
     "aya_asly@hotmail.com":        "עסלי",
     "lakinsheli@gmail.com":        "לקן",
     "berg.assaf@gmail.com":        "ברג",
+    "assaf.berg@mail.huji.ac.il":  "ברג",
     "gandelman@shamir.gov.il":     "גנדלמן",
     "nettastr@gmail.com":          "אגאג'ני",
     "liordekel3@gmail.com":        "דקל",

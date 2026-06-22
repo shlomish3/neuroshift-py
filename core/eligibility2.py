@@ -48,17 +48,17 @@ def eligibility_reason(name: str, date_iso: str, shift: str) -> str | None:
     if shift in DUTY_SHIFTS and any(bt in BLOCKS_DUTY for bt, _ in blocks):
         return "availability:duty-only-block"
 
-    # clinic-rule conflicts
+    # Weekly fixed-clinic rows should not veto real clinic-calendar assignments.
+    # The actual clinic calendar + capability matrix decide which clinic rows exist.
     todays_clinics = fixed_clinic_lut().get((name, weekday_letter(date_iso)), set())
-    if shift in CLINIC_SHIFTS and todays_clinics and shift not in todays_clinics:
-        return "availability:clinic-rule"
 
     # “מרפאה קבועה” nuance: blocks day/duty shifts outside the clinic itself
+    non_clinic_day_or_duty = (DAY_SHIFTS - CLINIC_SHIFTS) | DUTY_SHIFTS
     for bt, src in blocks:
         if (
             bt == "לא זמין"
             and src == "מרפאה קבועה"
-            and shift in (DAY_SHIFTS | DUTY_SHIFTS)
+            and shift in non_clinic_day_or_duty
             and shift not in todays_clinics
         ):
             return "availability:clinic-rule"
@@ -119,6 +119,11 @@ def get_eligible_workers(
         # These rows are assigned before nights, so the night pass must avoid
         # creating an אחרי תורנות conflict after the fact.
         if shift_type in ("ת.מיון", "ת.מיון 2"):
+            tomorrow_iso = (shift_date + timedelta(days=1)).isoformat()
+            tomorrow_clinics = fixed_clinic_lut().get((n, weekday_letter(tomorrow_iso)), set())
+            if tomorrow_clinics:
+                note(n, "tomorrow fixed clinic blocks night");  continue
+
             tomorrow = daily_assignments.get(shift_date + timedelta(days=1), {}).get(n, set())
             if any(s in CLINIC_SHIFTS or s == "מיון" for s in tomorrow):
                 note(n, "tomorrow morning blocks night");  continue
@@ -134,6 +139,21 @@ def get_eligible_workers(
 
         today_set = daily_assignments.get(shift_date, {}).get(n, set())
         senior    = is_senior(n, lut)
+
+        if n == "שמעון" and shift_type == "ייעוצים מובילים" and shift_date.weekday() != 4:
+            note(n, "Shimon consults only on Friday");  continue
+
+        if "רוטציה" in today_set and shift_type in DAY_SHIFTS and shift_type != "רוטציה":
+            note(n, "rotation blocks day shift");  continue
+        if shift_type == "רוטציה" and today_set.intersection(DAY_SHIFTS - {"רוטציה"}):
+            note(n, "day shift blocks rotation");  continue
+        if shift_type in DAY_SHIFTS:
+            incompatible_day = [
+                existing for existing in today_set.intersection(DAY_SHIFTS)
+                if (existing, shift_type) not in DUAL_OK
+            ]
+            if incompatible_day:
+                note(n, "illegal day pair");  continue
 
         # ── first shift today – always allowed ────────────────────────
         if not today_set:

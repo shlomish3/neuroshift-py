@@ -23,9 +23,10 @@ import pandas as pd
 from core.constants import( 
     WEEKDAY_BONUS, BONUS_SHIFT_TYPES, NIGHT_DUTY_SHIFTS, 
     RECENCY_WINDOW_DAYS, RECENCY_PENALTY_MAX, PENALTY_REDUCER,
+    DUAL_OK,
     )
 from core.eligibility2 import unavail_lookup, BLOCKS_ALL
-from core.holiday_utils import effective_weekday_letter, holiday_names_from_tables
+from core.holiday_utils import effective_weekday_letter, holiday_eve_names_from_tables, holiday_names_from_tables
 import logging
 from pathlib import Path
 from itertools import chain
@@ -195,6 +196,7 @@ def fixed_lookup(month: str, tables: dict) -> Dict[Tuple[date, str], List[str]]:
                 - timedelta(days=1)
 
     holiday_names = holiday_names_from_tables(tables)
+    holiday_eve_names = holiday_eve_names_from_tables(tables)
 
     # ── expand spans → dict ───────────────────────────────────
     out: Dict[Tuple[date, str], List[str]] = {}
@@ -207,7 +209,7 @@ def fixed_lookup(month: str, tables: dict) -> Dict[Tuple[date, str], List[str]]:
         d = span_start
         while d <= span_end:
             is_night_shift = row[COL_SHIFT] in NIGHT_DUTY_SHIFTS
-            effective_wd = effective_weekday_letter(d, holiday_names)
+            effective_wd = effective_weekday_letter(d, holiday_names, holiday_eve_names)
 
             # Night duties can be fixed on every date.
             # Other fixed shifts stay limited to normal Sun-Thu workdays.
@@ -263,19 +265,18 @@ def month_days(year_month: str) -> Iterable[date]:
     return (first + timedelta(days=i) for i in range((last - first).days + 1))
 
 # ──────────────────────────────────────────────────────────────
-#  Epilepsy↔EEG coupling: if גנדלמן has מרפאת אפילפסיה → also EEG that day
+#  גנדלמן EEG coupling
 # ──────────────────────────────────────────────────────────────
 def enforce_epilepsy_eeg_coupling(roster: pd.DataFrame,
                                   daily_assignments: Dict[date, Dict[str, Set[str]]] | None = None
                                   ) -> pd.DataFrame:
     """
-    Rule: On any day where 'מרפאת אפילפסיה' includes גנדלמן,
-    EEG that same day must be גנדלמן (exclusively).
-    If she isn't in מרפאת אפילפסיה that day, EEG is untouched.
+    Rule:
+    - On every day where גנדלמן works any shift, EEG ילדים that same day must
+      be גנדלמן exclusively.
     """
-    target_name   = _clean("גנדלמן")
-    epi_shift     = "מרפאת אפילפסיה גנדלמן"
-    eeg_shift     = "EEG"
+    target_name = _clean("גנדלמן")
+    eeg_children_shift = "EEG ילדים"
 
     def _split_names(cell: str) -> list[str]:
         if not isinstance(cell, str):
@@ -283,57 +284,93 @@ def enforce_epilepsy_eeg_coupling(roster: pd.DataFrame,
         out = []
         for n in cell.split(","):
             n = _clean(n)
-            if n and not n.startswith("⚠️") and n != "-":
-                out.append(n)
+            if not n or n == "-":
+                continue
+            if n.startswith("\u26a0"):
+                stripped = re.sub(r"^\u26a0\ufe0f?\s*\d+\s*/\s*\d+\s*", "", n).strip(" ,")
+                if not stripped or stripped == n:
+                    continue
+                n = stripped
+            if "לבחור" in n and "חלופי" in n:
+                continue
+            if n.lower().startswith("needs manual pick"):
+                continue
+            if re.fullmatch(r"\d+\s*/\s*\d+", n):
+                continue
+            out.append(n)
         return out
+
+    def _to_int(x, default=0):
+        try:
+            return int(x)
+        except Exception:
+            return default
 
     out = roster.copy()
 
-    # iterate only days where אפילפסיה has גנדלמן
-    mask_epi = out["Shift"] == epi_shift
-    for idx, row in out[mask_epi].iterrows():
-        names = set(_split_names(row["Assigned"]))
-        if target_name not in names:
-            continue  # only enforce on days she actually does אפילפסיה
+    def _force_single_assignment(d_iso: str, shift: str) -> None:
+        shift_mask = (out["Date"] == d_iso) & (out["Shift"] == shift)
+        if not shift_mask.any():
+            return
 
-        d_iso = row["Date"]
-        eeg_mask = (out["Date"] == d_iso) & (out["Shift"] == eeg_shift)
-        if not eeg_mask.any():
-            continue  # no EEG row that day
+        shift_idx = out.index[shift_mask][0]
+        if _to_int(out.at[shift_idx, "Needed"], 0) < 1:
+            out.at[shift_idx, "Needed"] = 1
+        if _to_int(out.at[shift_idx, "SoftCap"], 0) < 1:
+            out.at[shift_idx, "SoftCap"] = 1
 
-        eeg_idx = out.index[eeg_mask][0]
-        # Ensure caps allow exactly one (her)
-        def _to_int(x, default=0):
-            try:
-                return int(x)
-            except Exception:
-                return default
+        out.at[shift_idx, "Assigned"] = target_name
 
-        cur_need = _to_int(out.at[eeg_idx, "Needed"], 0)
-        cur_soft = _to_int(out.at[eeg_idx, "SoftCap"], 0)
-        if cur_need < 1:
-            out.at[eeg_idx, "Needed"] = 1
-        if cur_soft < 1:
-            out.at[eeg_idx, "SoftCap"] = 1
-
-        # Set EEG assignment to גנדלמן only (replace whoever was there)
-        out.at[eeg_idx, "Assigned"] = target_name
-
-        # Optional: keep daily_assignments in sync for the ledger
         if daily_assignments is not None:
             d = date.fromisoformat(d_iso)
-            # remove EEG from anyone else that day
             todays = daily_assignments.get(d, {})
             to_remove = []
             for worker, shifts in todays.items():
-                if eeg_shift in shifts and worker != target_name:
-                    shifts.discard(eeg_shift)
+                if shift in shifts and worker != target_name:
+                    shifts.discard(shift)
                     if not shifts:
                         to_remove.append(worker)
             for w in to_remove:
                 todays.pop(w, None)
-            # add EEG to גנדלמן
-            todays.setdefault(target_name, set()).add(eeg_shift)
+            todays.setdefault(target_name, set()).add(shift)
+
+    non_work_shifts = {"חופש", "רוטציה", "אחרי תורנות", "חלופי"}
+    gandelman_work_days = set()
+    gandelman_eeg_children_days = set()
+    for _, row in out.iterrows():
+        if row["Shift"] == eeg_children_shift and target_name in set(_split_names(row["Assigned"])):
+            gandelman_eeg_children_days.add(row["Date"])
+        if row["Shift"] == eeg_children_shift or row["Shift"] in non_work_shifts:
+            continue
+        if target_name in set(_split_names(row["Assigned"])):
+            gandelman_work_days.add(row["Date"])
+
+    for d_iso in sorted(gandelman_work_days):
+        d = date.fromisoformat(d_iso)
+        if d.weekday() in (4, 5):
+            continue
+        _force_single_assignment(d_iso, eeg_children_shift)
+        gandelman_eeg_children_days.add(d_iso)
+
+    def _needed(d_iso: str, shift: str) -> int:
+        mask = (out["Date"] == d_iso) & (out["Shift"] == shift)
+        if not mask.any():
+            return 0
+        return _to_int(out.at[out.index[mask][0], "Needed"], 0)
+
+    def _target_shifts(d_iso: str) -> set[str]:
+        shifts = set()
+        for _, row in out[out["Date"] == d_iso].iterrows():
+            if target_name in set(_split_names(row["Assigned"])):
+                shifts.add(row["Shift"])
+        return shifts
+
+    for d_iso in sorted(gandelman_eeg_children_days):
+        if _needed(d_iso, "EEG") < 1:
+            continue
+        existing = _target_shifts(d_iso) - {"EEG"}
+        if all((shift, "EEG") in DUAL_OK for shift in existing):
+            _force_single_assignment(d_iso, "EEG")
 
     return out
 
