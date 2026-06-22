@@ -55,6 +55,11 @@ from core.assign_utils import (
     enforce_epilepsy_eeg_coupling,
 )
 from core.availability_simple_parser import preferred_night_dates_from_simple
+from core.holiday_utils import (
+    effective_weekday_letter,
+    holiday_eve_names_from_tables,
+    holiday_names_from_tables,
+)
 
 if len(sys.argv) > 1:
     constants.CURRENT_TARGET_MONTH = sys.argv[1]
@@ -909,19 +914,34 @@ def auto_assign(
             for candidate_shift in RESIDENT_NIGHT_SHIFTS
         )
     }
-    sun_thu_month_dates = {d for d in month_dates if d.weekday() not in (4, 5)}
-    rotation_dates_by_name: dict[str, set[date]] = defaultdict(set)
-    for _, row in roster[roster["Shift"] == "רוטציה"].iterrows():
-        d = date.fromisoformat(str(row["Date"]))
-        if d.weekday() in (4, 5):
+    # A "whole-month" rotation is defined by the fixed-assignment sheet as
+    # covering the 1st through the 28th. Later dates vary by month length.
+    rotation_holiday_names = holiday_names_from_tables(tbl)
+    rotation_holiday_eve_names = holiday_eve_names_from_tables(tbl)
+    rotation_month_anchor_dates = {
+        d for d in month_dates
+        if d.day <= 28
+        and effective_weekday_letter(d, rotation_holiday_names, rotation_holiday_eve_names)
+        not in {"ו", "ש"}
+    }
+    fixed_rotation_dates_by_name: dict[str, set[date]] = defaultdict(set)
+    for (d, shift_type), names in fixed_raw.items():
+        if shift_type != "רוטציה" or d.weekday() in (4, 5):
             continue
-        for name in _names(row.Assigned):
-            rotation_dates_by_name[name].add(d)
+        for name in names:
+            name = str(name).strip()
+            if name:
+                fixed_rotation_dates_by_name[name].add(d)
     full_month_rotation_names = {
         name
-        for name, days in rotation_dates_by_name.items()
-        if sun_thu_month_dates and days >= sun_thu_month_dates
+        for name, days in fixed_rotation_dates_by_name.items()
+        if rotation_month_anchor_dates and days >= rotation_month_anchor_dates
     }
+    if full_month_rotation_names:
+        logger.info(
+            "Full-month rotation workers from fixed assignments: %s",
+            ", ".join(sorted(full_month_rotation_names)),
+        )
     rotation_override_blocks = {"חופש", "אחרי תורנות"}
     for idx, row in roster[roster["Shift"] == "רוטציה"].iterrows():
         d = date.fromisoformat(str(row["Date"]))
@@ -1641,12 +1661,25 @@ def auto_assign(
     def _row_index(d: date, shift: str) -> int | None:
         return row_index_by_date_shift.get((d, shift))
 
-    def _rotation_counts() -> Counter:
+    def _rotation_past_counts(shift_date: date) -> Counter:
         return Counter(
             name
             for _, row in roster[roster["Shift"] == "רוטציה"].iterrows()
-            if date.fromisoformat(str(row["Date"])).weekday() not in (4, 5)
+            for row_date in [date.fromisoformat(str(row["Date"]))]
+            if row_date < shift_date and row_date.weekday() not in (4, 5)
             for name in _name_list(row["Assigned"])
+        )
+
+    def _rotation_pull_balance_key(
+        pulled_name: str,
+        shift_date: date,
+        past_counts: Counter | None = None,
+    ) -> tuple[int, int, str]:
+        past_counts = past_counts or _rotation_past_counts(shift_date)
+        return (
+            -past_counts[pulled_name],
+            month_counts[pulled_name],
+            pulled_name,
         )
 
     def _rotation_pull_candidates(shift_type: str, shift_date: date, current: list[str]) -> list[str]:
@@ -1695,8 +1728,8 @@ def auto_assign(
             if name in eligible:
                 out.append(name)
 
-        rotation_counts = _rotation_counts()
-        return sorted(out, key=lambda name: (-rotation_counts[name], month_counts[name], name))
+        past_counts = _rotation_past_counts(shift_date)
+        return sorted(out, key=lambda name: _rotation_pull_balance_key(name, shift_date, past_counts))
 
     def _pull_from_full_month_rotation(shift_type: str, shift_date: date, name: str) -> None:
         if name not in full_month_rotation_names:
@@ -1943,6 +1976,14 @@ def auto_assign(
                     w for w in elig
                     if _personal_under_max(w, shift_type, shift_date)
                 ]
+                rotation_elig_set = set(rotation_elig)
+                rotation_past_counts_for_pick = _rotation_past_counts(shift_date)
+
+                def _rotation_pull_pick_prefix(w: str) -> tuple[int, int, int, str]:
+                    if w not in rotation_elig_set:
+                        return (0, 0, 0, "")
+                    return (1, *_rotation_pull_balance_key(w, shift_date, rotation_past_counts_for_pick))
+
                 if not elig:
                     if _try_free_worker_for_hard_row(idx, shift_type, shift_date, current):
                         filled += 1
@@ -2009,7 +2050,7 @@ def auto_assign(
                     )
                 pick = min(
                     elig,
-                    key=key_fn,
+                    key=lambda w: (_rotation_pull_pick_prefix(w), key_fn(w)),
                 )
                 current.append(pick)
                 _pull_from_full_month_rotation(shift_type, shift_date, pick)
@@ -2734,6 +2775,13 @@ def auto_assign(
         for idx, row in rows.iterrows():
             rows_by_date_shift[(str(row.Date), str(row.Shift))] = idx
 
+        def _can_swap_same_date_resident_type(name: str, target_shift: str, shift_date: date) -> bool:
+            if not worker_shift_lut.get((name, target_shift), False):
+                return False
+            if eligibility_reason(name, shift_date.isoformat(), target_shift) == "capability":
+                return False
+            return True
+
         swap_candidates: list[tuple[int, int, str, int, int, str, str]] = []
         for d_iso in sorted({str(row.Date) for _, row in rows.iterrows()}, reverse=True):
             idx_a = rows_by_date_shift.get((d_iso, "ת.מיון"))
@@ -2803,26 +2851,11 @@ def auto_assign(
             _rebuild_night_state_from_roster()
             _rebuild_live_counters_from_roster()
 
-            effective_last_night = _last_night_before(shift_date)
             a_can_take_b = (
-                _can_worker_take_shift(
-                    name_a,
-                    "ת.מיון 2",
-                    shift_date,
-                    last_night_map=effective_last_night,
-                )
-                and _resident_adjacent_night_penalty(name_a, shift_date, daily_assignments) == 0
-                and _resident_night_spacing_penalty(name_a, shift_date, effective_last_night) < 100
+                _can_swap_same_date_resident_type(name_a, "ת.מיון 2", shift_date)
             )
             b_can_take_a = (
-                _can_worker_take_shift(
-                    name_b,
-                    "ת.מיון",
-                    shift_date,
-                    last_night_map=effective_last_night,
-                )
-                and _resident_adjacent_night_penalty(name_b, shift_date, daily_assignments) == 0
-                and _resident_night_spacing_penalty(name_b, shift_date, effective_last_night) < 100
+                _can_swap_same_date_resident_type(name_b, "ת.מיון", shift_date)
             )
 
             if a_can_take_b and b_can_take_a:
@@ -3376,6 +3409,15 @@ def auto_assign(
                 break
         return improved
 
+    def _repair_resident_shift_type_final(max_steps: int = 8) -> int:
+        repaired = 0
+        for _ in range(max_steps):
+            if _try_resident_night_type_swap() or _try_cross_date_resident_night_type_swap():
+                repaired += 1
+            else:
+                break
+        return repaired
+
     def _repair_resident_weekend_balance(max_steps: int = 24) -> int:
         label = "resident_weekend_balance"
         if _repair_noop_cached(label):
@@ -3478,7 +3520,16 @@ def auto_assign(
             _forget_repair_noops()
         return repaired
 
-    def _try_resident_thursday_swap() -> bool:
+    def _resident_higher_priority_objective() -> tuple[tuple[int, int], tuple[int, int], int, tuple[int, int, int, int, int, int]]:
+        pool = _resident_night_pool()
+        return (
+            _resident_night_total_objective(),
+            _resident_weekend_objective(),
+            len(_find_resident_sandwiches()),
+            _resident_night_shift_balance_key(pool),
+        )
+
+    def _try_resident_thursday_swap(*, protect_higher_priorities: bool = False) -> bool:
         pool = {
             name
             for name in _resident_night_pool()
@@ -3492,6 +3543,8 @@ def auto_assign(
             return False
 
         current_objective = _resident_night_objective()
+        current_higher = _resident_higher_priority_objective()
+        current_thursday = _count_spread_and_square(thursday_night_counts, pool)
         rows = roster[roster["Shift"].isin(RESIDENT_NIGHT_SHIFTS)].copy()
         rows["_weekday"] = rows["Date"].map(lambda x: date.fromisoformat(str(x)).weekday())
         thursday_rows = rows[rows["_weekday"] == 3]
@@ -3571,7 +3624,16 @@ def auto_assign(
             if low_can_take_thursday and high_can_take_other:
                 roster.at[a_idx, "Assigned"] = _write_name_list(current_a + [low_name])
                 roster.at[b_idx, "Assigned"] = _write_name_list(current_b + [high_name])
-                if _resident_night_objective() < current_objective:
+                candidate_objective = _resident_night_objective()
+                candidate_higher = _resident_higher_priority_objective()
+                candidate_thursday = _count_spread_and_square(thursday_night_counts, pool)
+                accepted = (
+                    candidate_higher <= current_higher
+                    and candidate_thursday < current_thursday
+                    if protect_higher_priorities
+                    else candidate_objective < current_objective
+                )
+                if accepted:
                     logger.info(
                         "resident Thursday balance swap: %s %s %s <-> %s %s %s",
                         a_date.isoformat(), a_shift, high_name,
@@ -3598,6 +3660,14 @@ def auto_assign(
                 break
             repaired += 1
             _forget_repair_noops()
+        return repaired
+
+    def _repair_resident_thursday_final(max_steps: int = 8) -> int:
+        repaired = 0
+        for _ in range(max_steps):
+            if not _try_resident_thursday_swap(protect_higher_priorities=True):
+                break
+            repaired += 1
         return repaired
 
     def _repair_resident_night_fairness(
@@ -4622,6 +4692,13 @@ def auto_assign(
                     w for w in elig
                     if _personal_under_max(w, shift_type, shift_date)
                 ]
+                rotation_elig_set = set(rotation_elig)
+                rotation_past_counts_for_pick = _rotation_past_counts(shift_date)
+
+                def _rotation_pull_pick_prefix(w: str) -> tuple[int, int, int, str]:
+                    if w not in rotation_elig_set:
+                        return (0, 0, 0, "")
+                    return (1, *_rotation_pull_balance_key(w, shift_date, rotation_past_counts_for_pick))
 
                 # DEBUG: show elig list per attempt
                 if _is_debug_clinic(shift_type, shift_date):
@@ -4665,6 +4742,7 @@ def auto_assign(
                     pick = min(
                         elig,
                         key=lambda w: (
+                            _rotation_pull_pick_prefix(w),
                             _resident_night_balance_key(w, shift_type, shift_date),
                             _weekend_resident_night_key(w, shift_date),
                             _friday_work_key(w, shift_type, shift_date),
@@ -4693,6 +4771,7 @@ def auto_assign(
                     pick = min(
                         elig,
                         key=lambda w: (
+                            _rotation_pull_pick_prefix(w),
                             _konen_mion_key(w, shift_date),
                             0 if friday_attending and w in friday_attending else 1,
                             _friday_work_key(w, shift_type, shift_date),
@@ -4707,6 +4786,7 @@ def auto_assign(
                     pick = min(
                         elig,
                         key=lambda w: (
+                            _rotation_pull_pick_prefix(w),
                             _friday_work_key(w, shift_type, shift_date),
                             _yoeatzim_key(w, shift_date),
                         ),
@@ -4722,6 +4802,7 @@ def auto_assign(
                     pick = min(
                         elig,
                         key=lambda w: (
+                            _rotation_pull_pick_prefix(w),
                             0 if w == "גנדלמן" and _has_shift(daily_assignments, shift_date, w, "EEG ילדים") else 1,
                             _eeg_key(w, shift_date),
                         ),
@@ -4740,6 +4821,7 @@ def auto_assign(
                     pick = min(
                         elig,
                         key=lambda w: (
+                            _rotation_pull_pick_prefix(w),
                             0 if shift_date.weekday() == 4 and shift_type == ATTENDING_SHIFT and _has_shift(daily_assignments, shift_date, w, KONEN_MION_SHIFT) else 1,
                             0 if shift_type == "EEG" and w == "גנדלמן" and _has_shift(daily_assignments, shift_date, w, "EEG ילדים") else 1,
                             _personal_rule_key(w, shift_type, shift_date),
@@ -5003,6 +5085,15 @@ def auto_assign(
     )
     if final_last_resident_fairness:
         logger.info("Final resident night fairness repair changed %d assignments", final_last_resident_fairness)
+    final_thursday_balance = _repair_resident_thursday_final(max_steps=8)
+    if final_thursday_balance:
+        logger.info("Final resident Thursday-only repair changed %d assignments", final_thursday_balance)
+    final_shift_type_balance = _repair_resident_shift_type_final(max_steps=12)
+    if final_shift_type_balance:
+        logger.info("Final resident ת.מיון/ת.מיון 2 balance changed %d assignments", final_shift_type_balance)
+    final_thursday_after_type = _repair_resident_thursday_final(max_steps=4)
+    if final_thursday_after_type:
+        logger.info("Final protected Thursday re-check changed %d assignments", final_thursday_after_type)
     final_mandatory_personal = _apply_mandatory_personal_rules()
     final_companion_personal = _apply_companion_personal_rules()
     if final_mandatory_personal:
