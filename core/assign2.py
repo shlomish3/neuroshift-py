@@ -1661,29 +1661,61 @@ def auto_assign(
     def _row_index(d: date, shift: str) -> int | None:
         return row_index_by_date_shift.get((d, shift))
 
-    def _rotation_past_counts(shift_date: date) -> Counter:
+    def _rotation_current_counts() -> Counter:
         return Counter(
             name
             for _, row in roster[roster["Shift"] == "רוטציה"].iterrows()
             for row_date in [date.fromisoformat(str(row["Date"]))]
-            if row_date < shift_date and row_date.weekday() not in (4, 5)
+            if row_date.weekday() not in (4, 5)
             for name in _name_list(row["Assigned"])
+            if name in full_month_rotation_names
         )
+
+    def _rotation_count_balance_key(rotation_counts: Counter | None = None) -> tuple[int, int]:
+        if not full_month_rotation_names:
+            return (0, 0)
+        rotation_counts = rotation_counts or _rotation_current_counts()
+        values = [rotation_counts[name] for name in full_month_rotation_names]
+        if not values:
+            return (0, 0)
+        return (max(values) - min(values), sum(value * value for value in values))
 
     def _rotation_pull_balance_key(
         pulled_name: str,
-        shift_date: date,
-        past_counts: Counter | None = None,
-    ) -> tuple[int, int, str]:
-        past_counts = past_counts or _rotation_past_counts(shift_date)
+        rotation_counts: Counter | None = None,
+    ) -> tuple[int, int, int, int, int, str]:
+        rotation_counts = Counter(rotation_counts or _rotation_current_counts())
+        before = _rotation_count_balance_key(rotation_counts)
+        projected = Counter(rotation_counts)
+        projected[pulled_name] = max(projected[pulled_name] - 1, 0)
+        after = _rotation_count_balance_key(projected)
         return (
-            -past_counts[pulled_name],
+            *after,
+            0 if after < before else 1,
+            -rotation_counts[pulled_name],
             month_counts[pulled_name],
             pulled_name,
         )
 
+    def _rotation_no_pull_balance_key(
+        rotation_counts: Counter | None = None,
+    ) -> tuple[int, int, int, int, int, str]:
+        rotation_counts = rotation_counts or _rotation_current_counts()
+        return (*_rotation_count_balance_key(rotation_counts), 1, 0, 0, "")
+
+    def _rotation_pick_prefix(
+        name: str,
+        rotation_elig_set: set[str],
+        rotation_counts: Counter | None = None,
+    ) -> tuple[int, int, int, int, int, str]:
+        if name in rotation_elig_set:
+            return _rotation_pull_balance_key(name, rotation_counts)
+        return _rotation_no_pull_balance_key(rotation_counts)
+
     def _rotation_pull_candidates(shift_type: str, shift_date: date, current: list[str]) -> list[str]:
         if shift_date.weekday() in (4, 5):
+            return []
+        if shift_type in NIGHT_DUTY_SHIFTS:
             return []
         if shift_type == "רוטציה" or not _is_day_shift(shift_type):
             return []
@@ -1728,16 +1760,30 @@ def auto_assign(
             if name in eligible:
                 out.append(name)
 
-        past_counts = _rotation_past_counts(shift_date)
-        return sorted(out, key=lambda name: _rotation_pull_balance_key(name, shift_date, past_counts))
+        rotation_counts = _rotation_current_counts()
+        return sorted(out, key=lambda name: _rotation_pull_balance_key(name, rotation_counts))
 
     def _pull_from_full_month_rotation(shift_type: str, shift_date: date, name: str) -> None:
         if name not in full_month_rotation_names:
             return
+        if shift_type in NIGHT_DUTY_SHIFTS:
+            return
+        rotation_idx = _row_index(shift_date, "רוטציה")
+        if rotation_idx is None or name not in _name_list(roster.at[rotation_idx, "Assigned"]):
+            return
+        before_counts = _rotation_current_counts()
+        before_balance = _rotation_count_balance_key(before_counts)
         _remove_from_roster(shift_date, "רוטציה", name)
         _rebuild_daily_assignments_from_roster()
         _rebuild_night_state_from_roster()
         _rebuild_live_counters_from_roster()
+        after_counts = _rotation_current_counts()
+        logger.info(
+            "Pulled full-month rotation for day shift: %s %s from %s rotation balance %s -> %s counts %s -> %s",
+            shift_date.isoformat(), shift_type, name,
+            before_balance, _rotation_count_balance_key(after_counts),
+            dict(sorted(before_counts.items())), dict(sorted(after_counts.items())),
+        )
 
     def _resolve_same_day_conflicts() -> int:
         _rebuild_daily_assignments_from_roster()
@@ -1750,7 +1796,12 @@ def auto_assign(
                 for shift in shift_list:
                     if shift in keep:
                         continue
-                    if has_rotation and shift != "רוטציה" and _is_day_shift(shift):
+                    if (
+                        has_rotation
+                        and shift != "רוטציה"
+                        and shift not in NIGHT_DUTY_SHIFTS
+                        and _is_day_shift(shift)
+                    ):
                         if name in full_month_rotation_names:
                             _remove_from_roster(d, "רוטציה", name)
                             if "רוטציה" in keep:
@@ -1794,6 +1845,23 @@ def auto_assign(
             for d in sorted(rest_dates):
                 for shift in sorted(daily_assignments.get(d, {}).get(name, set())):
                     if shift in rest_only:
+                        continue
+                    if shift == "רוטציה" and name in full_month_rotation_names:
+                        rotation_idx = _row_index(d, "רוטציה")
+                        if rotation_idx is not None:
+                            current = [
+                                worker for worker in _name_list(roster.at[rotation_idx, "Assigned"])
+                                if worker != name
+                            ]
+                            roster.at[rotation_idx, "Assigned"] = _write_name_list(current)
+                            roster.at[rotation_idx, "Needed"] = len(current)
+                            roster.at[rotation_idx, "SoftCap"] = len(current)
+                        fixed_assignment_keys.discard((d, "רוטציה", name))
+                        removed += 1
+                        logger.info(
+                            "Removed full-month rotation overridden by after-duty rest: %s %s",
+                            d.isoformat(), name,
+                        )
                         continue
                     if (d, shift, name) in fixed_assignment_keys:
                         logger.warning(
@@ -1977,12 +2045,10 @@ def auto_assign(
                     if _personal_under_max(w, shift_type, shift_date)
                 ]
                 rotation_elig_set = set(rotation_elig)
-                rotation_past_counts_for_pick = _rotation_past_counts(shift_date)
+                rotation_counts_for_pick = _rotation_current_counts()
 
-                def _rotation_pull_pick_prefix(w: str) -> tuple[int, int, int, str]:
-                    if w not in rotation_elig_set:
-                        return (0, 0, 0, "")
-                    return (1, *_rotation_pull_balance_key(w, shift_date, rotation_past_counts_for_pick))
+                def _rotation_pull_pick_prefix(w: str) -> tuple[int, int, int, int, int, str]:
+                    return _rotation_pick_prefix(w, rotation_elig_set, rotation_counts_for_pick)
 
                 if not elig:
                     if _try_free_worker_for_hard_row(idx, shift_type, shift_date, current):
@@ -2766,7 +2832,6 @@ def auto_assign(
 
     def _try_resident_night_type_swap() -> bool:
         current_objective = _resident_night_objective()
-        current_weekend_history = _resident_weekend_history_load()
         rows = roster[roster["Shift"].isin(RESIDENT_NIGHT_SHIFTS)].copy()
         if rows.empty:
             return False
@@ -2864,9 +2929,7 @@ def auto_assign(
                 candidate_objective = _resident_night_objective()
                 if (
                     _resident_hard_objective(candidate_objective) <= _resident_hard_objective(current_objective)
-                    and _resident_preference_objective(candidate_objective) <= _resident_preference_objective(current_objective)
                     and _resident_shift_type_objective(candidate_objective) < _resident_shift_type_objective(current_objective)
-                    and _resident_weekend_history_load() <= current_weekend_history
                 ):
                     _rebuild_daily_assignments_from_roster()
                     _rebuild_night_state_from_roster()
@@ -3449,6 +3512,7 @@ def auto_assign(
         current_total = _resident_night_total_objective()
         current_rolling = _resident_rolling_total_objective()
         current_weekend = _resident_weekend_objective()
+        current_shift_type = _resident_shift_type_objective(_resident_night_objective())
         current_sandwiches = len(_find_resident_sandwiches())
         max_current = max(current_values)
         min_current = min(current_values)
@@ -3497,6 +3561,7 @@ def auto_assign(
                     if (
                         _resident_night_total_objective() <= current_total
                         and _resident_rolling_total_objective() < current_rolling
+                        and _resident_shift_type_objective(_resident_night_objective()) <= current_shift_type
                         and len(_find_resident_sandwiches()) <= current_sandwiches
                     ):
                         return True
@@ -4693,12 +4758,10 @@ def auto_assign(
                     if _personal_under_max(w, shift_type, shift_date)
                 ]
                 rotation_elig_set = set(rotation_elig)
-                rotation_past_counts_for_pick = _rotation_past_counts(shift_date)
+                rotation_counts_for_pick = _rotation_current_counts()
 
-                def _rotation_pull_pick_prefix(w: str) -> tuple[int, int, int, str]:
-                    if w not in rotation_elig_set:
-                        return (0, 0, 0, "")
-                    return (1, *_rotation_pull_balance_key(w, shift_date, rotation_past_counts_for_pick))
+                def _rotation_pull_pick_prefix(w: str) -> tuple[int, int, int, int, int, str]:
+                    return _rotation_pick_prefix(w, rotation_elig_set, rotation_counts_for_pick)
 
                 # DEBUG: show elig list per attempt
                 if _is_debug_clinic(shift_type, shift_date):

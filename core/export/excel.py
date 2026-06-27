@@ -964,6 +964,7 @@ def _build_sheet_toranut(
         D <- ת.מיון
         E <- ת.מיון 2
         F <- כונן מיון
+    - Column G: available senior formula
     - Column H: available resident formula
     - Columns I:Q: preserved summary table from the template
     - Column R: names marked "לא זמין לתורנות" for that date
@@ -988,15 +989,22 @@ def _build_sheet_toranut(
     cell.alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
     ws.column_dimensions["R"].width = 30
 
-    # Column H: Available workers
-    cell_h = ws.cell(3, 8, "פנויים לשיבוץ")
+    # Column G: available seniors for same-day כונן מיון.
+    cell_g = ws.cell(3, 7, "בכירים פנויים")
+    cell_g.font = Font(bold=True)
+    cell_g.alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
+    ws.column_dimensions["G"].width = 30
+
+    # Column H: available residents for ת.מיון / ת.מיון 2.
+    cell_h = ws.cell(3, 8, "מתמחים פנויים")
     cell_h.font = Font(bold=True)
     cell_h.alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
     ws.column_dimensions["H"].width = 30
 
     # The resident list and summary formulas live in the template table at I:Q.
     # Keep that block untouched and reuse the resident-name range for column H.
-    worker_list = "$I$13:$I$23"
+    senior_list = "$I$5:$I$12"
+    resident_list = "$I$13:$I$23"
 
     # Build lookup from roster_df
     month_prefix = f"{year:04d}-{mon:02d}"
@@ -1041,16 +1049,22 @@ def _build_sheet_toranut(
         night_blocked = ", ".join(nights_off_by_date.get(d_iso, [])) if nights_off_by_date else ""
         ws.cell(row_ptr, 18, night_blocked)                                         # R
 
+        senior_search_target = f'F{row_ptr} & " " & R{row_ptr}'
         if row_ptr == 4:
-            search_target = f'D{row_ptr} & " " & E{row_ptr} & " " & R{row_ptr}'
+            resident_search_target = f'D{row_ptr} & " " & E{row_ptr} & " " & R{row_ptr}'
         else:
-            search_target = f'D{row_ptr} & " " & E{row_ptr} & " " & D{row_ptr-1} & " " & E{row_ptr-1} & " " & R{row_ptr}'
+            resident_search_target = f'D{row_ptr} & " " & E{row_ptr} & " " & D{row_ptr-1} & " " & E{row_ptr-1} & " " & R{row_ptr}'
 
         # Using _xlfn. and ArrayFormula to prevent the openpyxl '@' bug
-        formula = f'=_xlfn.TEXTJOIN(", ", TRUE, _xlfn._xlws.FILTER({worker_list}, ISERROR(SEARCH({worker_list}, {search_target})), ""))'
+        senior_formula = f'=_xlfn.TEXTJOIN(", ", TRUE, _xlfn._xlws.FILTER({senior_list}, ISERROR(SEARCH({senior_list}, {senior_search_target})), ""))'
+        resident_formula = f'=_xlfn.TEXTJOIN(", ", TRUE, _xlfn._xlws.FILTER({resident_list}, ISERROR(SEARCH({resident_list}, {resident_search_target})), ""))'
         
+        g_cell = ws.cell(row_ptr, 7)
+        g_cell.value = ArrayFormula(f"G{row_ptr}", senior_formula)
+        g_cell.alignment = Alignment(wrap_text=True, horizontal="right", vertical="top", readingOrder=2)
+
         h_cell = ws.cell(row_ptr, 8)
-        h_cell.value = ArrayFormula(f"H{row_ptr}", formula)
+        h_cell.value = ArrayFormula(f"H{row_ptr}", resident_formula)
         h_cell.alignment = Alignment(wrap_text=True, horizontal="right", vertical="top", readingOrder=2)
         # ------------------------------
 
@@ -1059,9 +1073,9 @@ def _build_sheet_toranut(
 
     last_row = row_ptr - 1
 
-    # Style main table B:F, and H
+    # Style main table B:F and helper columns G:H.
     for r in range(3, last_row + 1):
-        for c in [2, 3, 4, 5, 6, 8]:  # Skip 7 (G)
+        for c in [2, 3, 4, 5, 6, 7, 8]:
             cell = ws.cell(r, c)
 
             try:
@@ -1077,7 +1091,7 @@ def _build_sheet_toranut(
                 elif d.weekday() == 5:
                     cell.fill = YELLOW
 
-            left = thick if c in (start_col, 8) else thin
+            left = thick if c in (start_col, 7) else thin
             right = thick if c in (start_col + 4, 8) else thin
             top = thick if r == 3 else thin
             bottom = thick if r == last_row else thin
@@ -1090,9 +1104,9 @@ def _build_sheet_toranut(
                 readingOrder=2,
             )
 
-    for c in [2, 3, 4, 5, 6, 8]:
+    for c in [2, 3, 4, 5, 6, 7, 8]:
         ws.cell(3, c).border = Border(
-            left=thick if c in (start_col, 8) else thin,
+            left=thick if c in (start_col, 7) else thin,
             right=thick if c in (start_col + 4, 8) else thin,
             top=thick,
             bottom=thin,
