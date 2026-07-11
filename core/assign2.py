@@ -353,6 +353,29 @@ def _resident_sandwich_penalty(
     return penalty
 
 
+def _resident_sandwich_pairs_from_dates(
+    by_name: Dict[str, Set[date]],
+    *,
+    movable_dates: Set[date] | None = None,
+) -> list[tuple[str, date, date]]:
+    """Return resident-night pairs separated by one night off.
+
+    If ``movable_dates`` is supplied, previous-month-only pairs stay out of
+    repair searches while cross-month pairs remain visible.
+    """
+    sandwiches: list[tuple[str, date, date]] = []
+    for name, night_dates in by_name.items():
+        for first in sorted(night_dates):
+            second = first + timedelta(days=2)
+            middle = first + timedelta(days=1)
+            if second not in night_dates or middle in night_dates:
+                continue
+            if movable_dates is not None and first not in movable_dates and second not in movable_dates:
+                continue
+            sandwiches.append((name, first, second))
+    return sandwiches
+
+
 def _resident_adjacent_night_penalty(
     name: str,
     shift_date: date,
@@ -1727,12 +1750,8 @@ def auto_assign(
 
     def _sandwich_counts_from_dates(by_name: dict[str, set[date]]) -> Counter:
         counts = Counter()
-        for name, night_dates in by_name.items():
-            for first_night in night_dates:
-                second_night = first_night + timedelta(days=2)
-                middle = first_night + timedelta(days=1)
-                if second_night in night_dates and middle not in night_dates:
-                    counts[name] += 1
+        for name, _, _ in _resident_sandwich_pairs_from_dates(by_name):
+            counts[name] += 1
         return counts
 
     def _refresh_resident_sandwich_cache() -> None:
@@ -2455,21 +2474,17 @@ def auto_assign(
                 _mark_personal_rule_missing(rule)
         return changed
 
-    def _find_resident_sandwiches() -> list[tuple[str, date, date]]:
+    def _find_resident_sandwiches(*, include_history: bool = False) -> list[tuple[str, date, date]]:
         by_name: dict[str, set[date]] = defaultdict(set)
+        if include_history:
+            for name, night_dates in previous_resident_night_dates.items():
+                by_name[name].update(night_dates)
         for d, by_worker in daily_assignments.items():
             for name, shifts in by_worker.items():
                 if shifts.intersection(RESIDENT_NIGHT_SHIFTS):
                     by_name[name].add(d)
-
-        sandwiches: list[tuple[str, date, date]] = []
-        for name, dates in by_name.items():
-            for d in sorted(dates):
-                later = d + timedelta(days=2)
-                middle = d + timedelta(days=1)
-                if later in dates and middle not in dates:
-                    sandwiches.append((name, d, later))
-        return sandwiches
+        movable_dates = set(daily_assignments) if include_history else None
+        return _resident_sandwich_pairs_from_dates(by_name, movable_dates=movable_dates)
 
     def _resident_night_row_index(d: date, name: str) -> int | None:
         for idx in resident_night_row_indexes:
@@ -2589,7 +2604,7 @@ def auto_assign(
             return 0
         repaired = 0
         for _ in range(10):
-            sandwiches = _find_resident_sandwiches()
+            sandwiches = _find_resident_sandwiches(include_history=True)
             if not sandwiches:
                 _remember_repair_noop(label)
                 break
@@ -2616,6 +2631,194 @@ def auto_assign(
             if not changed:
                 _remember_repair_noop(label)
                 break
+        return repaired
+
+    def _try_resident_sandwich_swap(max_trials: int = 60) -> bool:
+        """Swap two resident nights while preserving totals and higher priorities."""
+        current_objective = _resident_night_objective()
+        if len(current_objective) <= 12:
+            return False
+
+        sandwiches = _find_resident_sandwiches(include_history=True)
+        if not sandwiches:
+            return False
+
+        rows = roster[roster["Shift"].isin(RESIDENT_NIGHT_SHIFTS)].copy()
+        if rows.empty:
+            return False
+        rows["_date"] = rows["Date"].map(lambda value: date.fromisoformat(str(value)))
+
+        combined_dates: dict[str, set[date]] = defaultdict(set)
+        for name, night_dates in previous_resident_night_dates.items():
+            combined_dates[name].update(night_dates)
+        for d, by_worker in daily_assignments.items():
+            for name, shifts in by_worker.items():
+                if shifts.intersection(RESIDENT_NIGHT_SHIFTS):
+                    combined_dates[name].add(d)
+
+        def day_class(d: date) -> int:
+            if d.weekday() == 5:
+                return 2
+            if d.weekday() == 4:
+                return 1
+            return 0
+
+        def sandwich_count(name: str, dates: set[date]) -> int:
+            return len(_resident_sandwich_pairs_from_dates({name: dates}))
+
+        candidates: list[tuple[int, int, int, int, str, int, int, str, str]] = []
+        seen: set[tuple[int, str, int, str]] = set()
+        for old_name, first, second in sandwiches:
+            for old_date in (second, first):
+                old_idx = _resident_night_row_index(old_date, old_name)
+                if old_idx is None:
+                    continue
+                old_shift = str(roster.at[old_idx, "Shift"])
+                if (old_date, old_shift, old_name) in fixed_assignment_keys:
+                    continue
+                old_preference_cost = _preferred_night_removal_penalty(old_name, old_shift, old_date)
+                if old_preference_cost >= 100:
+                    continue
+
+                for other_idx, other_row in rows.iterrows():
+                    other_date = other_row["_date"]
+                    other_shift = str(other_row.Shift)
+                    if other_idx == old_idx or other_date == old_date:
+                        continue
+                    if day_class(other_date) != day_class(old_date):
+                        continue
+
+                    for other_name in _name_list(other_row.Assigned):
+                        if other_name == old_name:
+                            continue
+                        key = (old_idx, old_name, other_idx, other_name)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        if (other_date, other_shift, other_name) in fixed_assignment_keys:
+                            continue
+                        other_preference_cost = _preferred_night_removal_penalty(
+                            other_name, other_shift, other_date,
+                        )
+                        if other_preference_cost >= 100:
+                            continue
+                        if not worker_shift_lut.get((other_name, old_shift), False):
+                            continue
+                        if not worker_shift_lut.get((old_name, other_shift), False):
+                            continue
+
+                        old_dates = set(combined_dates[old_name])
+                        other_dates = set(combined_dates[other_name])
+                        if other_date in old_dates or old_date in other_dates:
+                            continue
+                        before_count = (
+                            sandwich_count(old_name, old_dates)
+                            + sandwich_count(other_name, other_dates)
+                        )
+                        old_dates.discard(old_date)
+                        old_dates.add(other_date)
+                        other_dates.discard(other_date)
+                        other_dates.add(old_date)
+                        after_count = (
+                            sandwich_count(old_name, old_dates)
+                            + sandwich_count(other_name, other_dates)
+                        )
+                        improvement = before_count - after_count
+                        if improvement <= 0:
+                            continue
+                        candidates.append((
+                            -improvement,
+                            0 if old_shift == other_shift else 1,
+                            old_preference_cost + other_preference_cost,
+                            abs((other_date - old_date).days),
+                            other_date.isoformat(),
+                            old_idx,
+                            other_idx,
+                            old_name,
+                            other_name,
+                        ))
+
+        for _, _, _, _, _, old_idx, other_idx, old_name, other_name in sorted(candidates)[:max_trials]:
+            old_date = _row_date(old_idx)
+            other_date = _row_date(other_idx)
+            old_shift = str(roster.at[old_idx, "Shift"])
+            other_shift = str(roster.at[other_idx, "Shift"])
+            original_old = _name_list(roster.at[old_idx, "Assigned"])
+            original_other = _name_list(roster.at[other_idx, "Assigned"])
+            if old_name not in original_old or other_name not in original_other:
+                continue
+
+            current_old = [name for name in original_old if name != old_name]
+            current_other = [name for name in original_other if name != other_name]
+            roster.at[old_idx, "Assigned"] = _write_name_list(current_old)
+            roster.at[other_idx, "Assigned"] = _write_name_list(current_other)
+            _rebuild_daily_assignments_from_roster()
+            _rebuild_night_state_from_roster()
+            _rebuild_live_counters_from_roster()
+
+            other_can_take_old = _can_worker_take_shift(
+                other_name,
+                old_shift,
+                old_date,
+                last_night_map=_last_night_before(old_date),
+            )
+            old_can_take_other = _can_worker_take_shift(
+                old_name,
+                other_shift,
+                other_date,
+                last_night_map=_last_night_before(other_date),
+            )
+            if other_can_take_old and old_can_take_other:
+                roster.at[old_idx, "Assigned"] = _write_name_list(current_old + [other_name])
+                roster.at[other_idx, "Assigned"] = _write_name_list(current_other + [old_name])
+                _rebuild_daily_assignments_from_roster()
+                _rebuild_night_state_from_roster()
+                _rebuild_live_counters_from_roster()
+                locally_legal = (
+                    _resident_adjacent_night_penalty(other_name, old_date, daily_assignments) == 0
+                    and _resident_adjacent_night_penalty(old_name, other_date, daily_assignments) == 0
+                )
+                candidate_objective = _resident_night_objective() if locally_legal else current_objective
+                if (
+                    locally_legal
+                    and candidate_objective[:12] == current_objective[:12]
+                    and candidate_objective[12] < current_objective[12]
+                    and candidate_objective < current_objective
+                ):
+                    logger.info(
+                        "resident rolling sandwich total-preserving swap: "
+                        "%s %s %s <-> %s %s %s sandwiches %d -> %d",
+                        old_date.isoformat(), old_shift, old_name,
+                        other_date.isoformat(), other_shift, other_name,
+                        current_objective[12], candidate_objective[12],
+                    )
+                    return True
+
+            roster.at[old_idx, "Assigned"] = _write_name_list(original_old)
+            roster.at[other_idx, "Assigned"] = _write_name_list(original_other)
+            _rebuild_daily_assignments_from_roster()
+            _rebuild_night_state_from_roster()
+            _rebuild_live_counters_from_roster()
+
+        return False
+
+    def _repair_resident_sandwich_swaps(
+        max_steps: int = 10,
+        *,
+        use_cache: bool = True,
+    ) -> int:
+        label = "resident_sandwich_swaps"
+        if use_cache and _repair_noop_cached(label):
+            return 0
+        repaired = 0
+        for _ in range(max_steps):
+            if not _try_resident_sandwich_swap():
+                if use_cache:
+                    _remember_repair_noop(label)
+                break
+            repaired += 1
+            if use_cache:
+                _forget_repair_noops()
         return repaired
 
     def _resident_night_pool() -> set[str]:
@@ -2880,7 +3083,9 @@ def auto_assign(
             weekend_only = True
             run_direct_replacement = False
         else:
-            sandwich_names = {name for name, _, _ in _find_resident_sandwiches()}
+            sandwich_names = {
+                name for name, _, _ in _find_resident_sandwiches(include_history=True)
+            }
             if sandwich_names:
                 old_pool = sandwich_names
                 candidate_pool = pool - sandwich_names
@@ -4076,7 +4281,7 @@ def auto_assign(
         return (
             _resident_night_total_objective(),
             _resident_weekend_objective(),
-            len(_find_resident_sandwiches()),
+            _resident_rolling_sandwich_total(pool),
             _resident_night_shift_balance_key(pool),
         )
 
@@ -4236,6 +4441,7 @@ def auto_assign(
             repaired += _repair_resident_rolling_total_balance()
             repaired += _repair_resident_weekend_balance(max_steps=weekend_steps)
             repaired += _repair_resident_sandwiches()
+            repaired += _repair_resident_sandwich_swaps()
             repaired += _repair_resident_weekend_balance(max_steps=weekend_steps)
             repaired += _optimize_resident_night_assignments(max_steps=type_steps)
             repaired += _repair_resident_weekend_balance(max_steps=weekend_steps)
@@ -5669,6 +5875,15 @@ def auto_assign(
     if final_weekend_after_type:
         _forget_repair_noops()
         logger.info("Final protected resident weekend re-check changed %d assignments", final_weekend_after_type)
+    final_sandwich_swaps = timed_repair(
+        "resident_sandwich_final",
+        lambda: _repair_resident_sandwich_swaps(max_steps=8, use_cache=False),
+    )
+    if final_sandwich_swaps:
+        logger.info(
+            "Final total-preserving resident sandwich repair changed %d assignment pairs",
+            final_sandwich_swaps,
+        )
     final_shift_type_after_weekend = timed_repair(
         "resident_shift_type_after_weekend",
         lambda: _repair_resident_shift_type_final(max_steps=12),
