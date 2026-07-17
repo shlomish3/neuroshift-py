@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import date
 import unittest
 
-from core.assign2 import _resident_sandwich_pairs_from_dates
+from core.assign2 import (
+    _resident_sandwich_pairs_from_dates,
+    _resident_type_compensation_distance,
+    _resident_type_excess_gap,
+)
 
 
 class ResidentSandwichPairsTests(unittest.TestCase):
@@ -40,6 +44,20 @@ class ResidentSandwichPairsTests(unittest.TestCase):
 
         self.assertEqual(result, [])
 
+
+class ResidentShiftTypeFairnessTests(unittest.TestCase):
+    def test_even_total_requires_equal_shift_types(self) -> None:
+        self.assertEqual(_resident_type_excess_gap(6, 3, 3), 0)
+        self.assertEqual(_resident_type_excess_gap(6, 4, 2), 2)
+
+    def test_odd_total_allows_exactly_one_extra_shift_type(self) -> None:
+        self.assertEqual(_resident_type_excess_gap(7, 3, 4), 0)
+        self.assertEqual(_resident_type_excess_gap(7, 5, 2), 2)
+
+    def test_harder_month_prefers_extra_tmion2(self) -> None:
+        self.assertEqual(_resident_type_compensation_distance(7, 3, 4, 2), 0)
+        self.assertGreater(_resident_type_compensation_distance(7, 4, 3, 2), 0)
+        self.assertEqual(_resident_type_compensation_distance(6, 3, 3, 2), 0)
 
 if __name__ == "__main__":
     unittest.main()

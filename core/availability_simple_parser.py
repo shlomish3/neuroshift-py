@@ -150,6 +150,33 @@ def preferred_night_dates_from_simple(
     return out
 
 
+def submitted_names_from_simple(
+    df: pd.DataFrame,
+    *,
+    name_col: str = "שם",
+    email_col: str = "כתובת אימייל",
+    ts_col: str = "חותמת זמן",
+) -> set[str]:
+    """Return workers represented by a latest availability-form submission."""
+    if df.empty:
+        return set()
+    df = df.copy()
+    cols_norm = {_clean(column): column for column in df.columns}
+    name_col = cols_norm.get(_clean(name_col)) or cols_norm.get(_clean("בחר את שמך")) or name_col
+    email_col = cols_norm.get(_clean(email_col)) or email_col
+    if name_col not in df.columns and email_col not in df.columns:
+        return set()
+
+    names: set[str] = set()
+    for _, row in df.iterrows():
+        raw_name = _clean(row.get(name_col, ""))
+        email = _clean(row.get(email_col, "")).lower()
+        name = EMAIL_TO_NAME_NORMALIZED.get(email, raw_name)
+        if name:
+            names.add(name)
+    return names
+
+
 def unavail_from_simple(
     df: pd.DataFrame,
     *,

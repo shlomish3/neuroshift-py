@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import date, timedelta
-from typing import Callable, Dict, Set
+from typing import Callable, Dict, NamedTuple, Set
 
 import hashlib
 import pandas as pd
@@ -55,7 +55,10 @@ from core.assign_utils import (
     write_unassigned_ledger,
     enforce_epilepsy_eeg_coupling,
 )
-from core.availability_simple_parser import preferred_night_dates_from_simple
+from core.availability_simple_parser import (
+    preferred_night_dates_from_simple,
+    submitted_names_from_simple,
+)
 from core.holiday_utils import (
     effective_weekday_letter,
     holiday_eve_names_from_tables,
@@ -123,6 +126,59 @@ EEG_SOFT_CAPS = {
 RESIDENT_NIGHT_EXTRA_CAPACITY = {
     "\u05d7\u05d3\u05d9\u05d2'\u05d4": 1,
 }
+
+
+class ResidentNightMetrics(NamedTuple):
+    """Resident-duty objectives in their protected project priority order."""
+
+    missing: int
+    total: tuple[int, int]
+    weekend_friday: tuple[int, int, int, int]
+    saturday: tuple[int, int]
+    sandwich_total: int
+    sandwich_distribution: tuple[int, int]
+    shift_type: tuple[int, int, int, int, int, int]
+
+
+class ResidentNightObjective(NamedTuple):
+    core: ResidentNightMetrics
+    preferred: tuple[int, int, int, int]
+    personal: int
+    thursday: tuple[int, int]
+    history: tuple[int, int, int, int, int]
+
+
+RESIDENT_PRIORITY_STAGES = (
+    "missing",
+    "total",
+    "weekend_friday",
+    "saturday",
+    "sandwich_total",
+    "sandwich_distribution",
+    "shift_type",
+)
+
+
+def _resident_core_key(metrics: ResidentNightMetrics) -> tuple[object, ...]:
+    return tuple(getattr(metrics, field) for field in RESIDENT_PRIORITY_STAGES)
+
+
+def _resident_stage_improves(
+    before: ResidentNightMetrics,
+    after: ResidentNightMetrics,
+    stage: str,
+) -> bool:
+    """Return true when ``stage`` improves without worsening an earlier stage."""
+
+    try:
+        stage_index = RESIDENT_PRIORITY_STAGES.index(stage)
+    except ValueError as exc:
+        raise ValueError(f"Unknown resident priority stage: {stage}") from exc
+
+    for protected_stage in RESIDENT_PRIORITY_STAGES[:stage_index]:
+        if getattr(after, protected_stage) > getattr(before, protected_stage):
+            return False
+    return getattr(after, stage) < getattr(before, stage)
 
 # ───────────────────────────────────────────────
 # Focused debug target (you can change these)
@@ -376,6 +432,24 @@ def _resident_sandwich_pairs_from_dates(
     return sandwiches
 
 
+def _resident_type_excess_gap(total: int, tmion: int, tmion2: int) -> int:
+    """Gap beyond the mathematically unavoidable parity difference."""
+    return max(0, abs(tmion - tmion2) - (total % 2))
+
+
+def _resident_type_compensation_distance(
+    total: int,
+    tmion: int,
+    tmion2: int,
+    burden: int,
+) -> int:
+    """Distance from a balanced split, leaning odd totals to ת.מיון 2."""
+    if burden <= 0:
+        return 0
+    desired_delta = -1 if total % 2 else 0
+    return burden * abs((tmion - tmion2) - desired_delta)
+
+
 def _resident_adjacent_night_penalty(
     name: str,
     shift_date: date,
@@ -523,6 +597,13 @@ def auto_assign(
     except Exception as e:
         logger.warning("Failed to parse preferred night-duty dates: %s: %r", type(e).__name__, e)
         preferred_night_requests = {}
+    try:
+        availability_submitters = submitted_names_from_simple(
+            tbl.get("requests", pd.DataFrame())
+        )
+    except Exception as e:
+        logger.warning("Failed to identify availability-form submitters: %s: %r", type(e).__name__, e)
+        availability_submitters = set()
 
     # Per-shift fairness starts fresh each generated month. Imported history is
     # used for night-duty recency and month-boundary blocking, not lifetime shift
@@ -549,6 +630,8 @@ def auto_assign(
     prev_month_str = prev_month_first.strftime("%Y-%m")
     previous_resident_night_counts = Counter()
     previous_resident_weekend_counts = Counter()
+    previous_senior_night_counts = Counter()
+    previous_senior_weekend_counts = Counter()
     previous_resident_night_dates: Dict[str, Set[date]] = defaultdict(set)
     previous_shimon_friday = False
     (
@@ -564,6 +647,10 @@ def auto_assign(
         previous_resident_night_counts.update(summary_night_counts)
         previous_resident_weekend_counts.update(summary_weekend_counts)
         previous_shimon_friday = summary_shimon_friday
+    raw_resident_night_counts = Counter()
+    raw_resident_weekend_counts = Counter()
+    raw_senior_night_counts = Counter()
+    raw_senior_weekend_counts = Counter()
     if not hist_df.empty and {"Date", "Name", "Shift"}.issubset(hist_df.columns):
         for _, r in hist_df.iterrows():
             hist_date = _parse_history_date(r["Date"])
@@ -575,13 +662,21 @@ def auto_assign(
                 previous_shimon_friday = True
             if name and shift in RESIDENT_NIGHT_SHIFTS:
                 previous_resident_night_dates[name].add(hist_date)
-            if loaded_previous_summary:
-                continue
-            if not name or shift not in RESIDENT_NIGHT_SHIFTS:
-                continue
-            previous_resident_night_counts[name] += 1
-            if hist_date.weekday() in (4, 5):
-                previous_resident_weekend_counts[name] += 1
+                raw_resident_night_counts[name] += 1
+                if hist_date.weekday() in (4, 5):
+                    raw_resident_weekend_counts[name] += 1
+            elif name and shift == KONEN_MION_SHIFT:
+                raw_senior_night_counts[name] += 1
+                if hist_date.weekday() in (4, 5):
+                    raw_senior_weekend_counts[name] += 1
+
+    if raw_resident_night_counts:
+        previous_resident_night_counts.clear()
+        previous_resident_night_counts.update(raw_resident_night_counts)
+        previous_resident_weekend_counts.clear()
+        previous_resident_weekend_counts.update(raw_resident_weekend_counts)
+    previous_senior_night_counts.update(raw_senior_night_counts)
+    previous_senior_weekend_counts.update(raw_senior_weekend_counts)
 
     previous_after_duty_names: list[str] = []
     if not hist_df.empty and {"Date", "Name", "Shift"}.issubset(hist_df.columns):
@@ -924,6 +1019,14 @@ def auto_assign(
         ].iterrows()
         for name in _names(row.Assigned)
     )
+    konen_weekend_counts = Counter(
+        name
+        for _, row in roster[
+            (roster["Shift"] == KONEN_MION_SHIFT)
+            & roster["Date"].map(lambda x: date.fromisoformat(str(x)).weekday() in (4, 5))
+        ].iterrows()
+        for name in _names(row.Assigned)
+    )
     yoeatzim_counts = Counter(
         name
         for _, row in roster[roster["Shift"] == YOEATZIM_SHIFT].iterrows()
@@ -961,6 +1064,7 @@ def auto_assign(
         for (name, shift), ok in worker_shift_lut.items()
         if ok
         and shift in RESIDENT_NIGHT_SHIFTS
+        and (not availability_submitters or name in availability_submitters)
         and any(
             worker_shift_lut.get((name, candidate_shift), False)
             and eligibility_reason(name, d.isoformat(), candidate_shift) is None
@@ -968,6 +1072,8 @@ def auto_assign(
             for candidate_shift in RESIDENT_NIGHT_SHIFTS
         )
     }
+    resident_fairness_pool = set(active_resident_night_names)
+    resident_fairness_pool_excluded: set[str] = set()
     # A "whole-month" rotation is defined by the fixed-assignment sheet as
     # covering the 1st through the 28th. Later dates vary by month length.
     rotation_holiday_names = holiday_names_from_tables(tbl)
@@ -1291,6 +1397,7 @@ def auto_assign(
             counter.clear()
         konen_month_counts.clear()
         konen_friday_counts.clear()
+        konen_weekend_counts.clear()
         yoeatzim_counts.clear()
         yoeatzim_weekday_counts.clear()
         attending_counts.clear()
@@ -1324,6 +1431,8 @@ def auto_assign(
                     konen_month_counts[name] += 1
                     if d.weekday() == 4:
                         konen_friday_counts[name] += 1
+                    if d.weekday() in (4, 5):
+                        konen_weekend_counts[name] += 1
                 elif shift == YOEATZIM_SHIFT:
                     yoeatzim_counts[name] += 1
                     if d.weekday() not in (4, 5):
@@ -1495,6 +1604,8 @@ def auto_assign(
         konen_month_counts[name] += 1
         if shift_date.weekday() == 4:
             konen_friday_counts[name] += 1
+        if shift_date.weekday() in (4, 5):
+            konen_weekend_counts[name] += 1
 
     def _shimon_friday_due() -> bool:
         return not previous_shimon_friday
@@ -1559,7 +1670,7 @@ def auto_assign(
         return previous_resident_weekend_counts[name] + weekend_night_counts[name]
 
     def _previous_resident_night_baseline() -> int:
-        pool = active_resident_night_names or set(previous_resident_night_counts)
+        pool = resident_fairness_pool or active_resident_night_names or set(previous_resident_night_counts)
         if not pool:
             return 0
         return min(previous_resident_night_counts[name] for name in pool)
@@ -1576,12 +1687,14 @@ def auto_assign(
         )
         if not previous_overload or shift_type not in RESIDENT_NIGHT_SHIFTS:
             return 0
-        current_delta = (
-            resident_night_shift_counts["ת.מיון"][name]
-            - resident_night_shift_counts["ת.מיון 2"][name]
+        projected_tmion = resident_night_shift_counts["ת.מיון"][name] + int(shift_type == "ת.מיון")
+        projected_tmion2 = resident_night_shift_counts["ת.מיון 2"][name] + int(shift_type == "ת.מיון 2")
+        return _resident_type_compensation_distance(
+            projected_tmion + projected_tmion2,
+            projected_tmion,
+            projected_tmion2,
+            previous_overload,
         )
-        projected_delta = current_delta + (1 if shift_type == "ת.מיון" else -1)
-        return previous_overload * projected_delta
 
     def _resident_personal_night_penalty(name: str, shift_type: str, shift_date: date) -> tuple[int, int]:
         if name == ESLEY_NAME and shift_date.weekday() == 1:
@@ -1622,14 +1735,54 @@ def auto_assign(
             _refresh_resident_sandwich_cache()
         return resident_sandwich_counts
 
+    def _resident_actionable_sandwich_counts() -> Counter:
+        """Count current-month and cross-month pairs, excluding past-only pairs."""
+        by_name: dict[str, set[date]] = defaultdict(set)
+        for name, dates_for_name in previous_resident_night_dates.items():
+            by_name[name].update(dates_for_name)
+        for d, by_worker in daily_assignments.items():
+            if d not in month_dates:
+                continue
+            for name, shifts in by_worker.items():
+                if shifts.intersection(RESIDENT_NIGHT_SHIFTS):
+                    by_name[name].add(d)
+        counts = Counter()
+        for name, _, _ in _resident_sandwich_pairs_from_dates(
+            by_name,
+            movable_dates=set(month_dates),
+        ):
+            counts[name] += 1
+        return counts
+
+    def _resident_sandwich_distribution_objective(
+        counts: Counter | None = None,
+        pool: set[str] | None = None,
+    ) -> tuple[int, int]:
+        active_pool = pool or _resident_night_pool()
+        if not active_pool:
+            return (0, 0)
+        active_counts = counts if counts is not None else _resident_actionable_sandwich_counts()
+        values = [active_counts[name] for name in active_pool]
+        return (max(values, default=0), sum(value * value for value in values))
+
     def _resident_sandwich_balance_key(name: str, shift_date: date) -> tuple[int, int, int]:
-        current_counts = _resident_sandwich_count_by_name()
+        current_counts = _resident_actionable_sandwich_counts()
         projected_delta = _resident_sandwich_penalty_for(name, shift_date) // 100
-        return (
-            current_counts[name] + projected_delta,
-            projected_delta,
-            current_counts[name],
+        projected_counts = Counter(current_counts)
+        projected_counts[name] += projected_delta
+        projected_distribution = _resident_sandwich_distribution_objective(
+            projected_counts,
+            _resident_night_pool() | {name},
         )
+        return (
+            projected_delta,
+            *projected_distribution,
+        )
+
+    def _resident_actionable_sandwich_total(pool: set[str] | None = None) -> int:
+        counts = _resident_actionable_sandwich_counts()
+        active_pool = pool or _resident_night_pool()
+        return sum(counts[name] for name in active_pool)
 
     def _resident_rolling_sandwich_total(pool: set[str] | None = None) -> int:
         counts = _resident_sandwich_count_by_name()
@@ -1656,20 +1809,36 @@ def auto_assign(
         if burden <= 0:
             return 0
 
-        projected_delta = (
-            resident_night_shift_counts["ת.מיון"][name]
-            + (1 if shift_type == "ת.מיון" else 0)
-            - resident_night_shift_counts["ת.מיון 2"][name]
-            - (1 if shift_type == "ת.מיון 2" else 0)
+        projected_tmion = resident_night_shift_counts["ת.מיון"][name] + int(shift_type == "ת.מיון")
+        projected_tmion2 = resident_night_shift_counts["ת.מיון 2"][name] + int(shift_type == "ת.מיון 2")
+        return _resident_type_compensation_distance(
+            projected_tmion + projected_tmion2,
+            projected_tmion,
+            projected_tmion2,
+            burden,
         )
-        return burden * projected_delta
 
-    def _resident_projected_fairness_key(name: str, shift_type: str, shift_date: date) -> tuple[int, ...]:
+    def _projected_count_objective(
+        counts: Counter,
+        pool: set[str],
+        name: str,
+        delta: int,
+    ) -> tuple[int, int]:
+        projected = Counter({worker: counts[worker] for worker in pool})
+        projected[name] += delta
+        return _count_spread_and_square(projected, pool)
+
+    def _resident_assignment_jitter(name: str, shift_type: str, shift_date: date) -> int:
+        jitter_key = f"{month}|{shift_date.isoformat()}|{shift_type}|{name}".encode("utf-8")
+        return int.from_bytes(hashlib.blake2s(jitter_key, digest_size=2).digest(), "big")
+
+    def _resident_projected_fairness_key(name: str, shift_type: str, shift_date: date) -> tuple:
         if shift_type not in RESIDENT_NIGHT_SHIFTS:
             return (0,)
 
         weekend_add = int(shift_date.weekday() in (4, 5))
         saturday_add = int(shift_date.weekday() == 5)
+        friday_add = int(shift_date.weekday() == 4)
         thursday_add = int(shift_date.weekday() == 3)
         projected_total = month_counts[name] + 1
         projected_weekend = weekend_night_counts[name] + weekend_add
@@ -1684,35 +1853,84 @@ def auto_assign(
         projected_thursday = thursday_night_counts[name] + thursday_add
         projected_tmion = resident_night_shift_counts["ת.מיון"][name] + (1 if shift_type == "ת.מיון" else 0)
         projected_tmion2 = resident_night_shift_counts["ת.מיון 2"][name] + (1 if shift_type == "ת.מיון 2" else 0)
-        projected_type_gap = abs(projected_tmion - projected_tmion2)
+        projected_type_gap = _resident_type_excess_gap(
+            projected_tmion + projected_tmion2,
+            projected_tmion,
+            projected_tmion2,
+        )
         projected_shift_count = resident_night_shift_counts[shift_type][name] + 1
         sandwich_key = _resident_sandwich_balance_key(name, shift_date)
-        projected_weekend_stack = projected_total * projected_weekend if weekend_add else 0
-        projected_rolling_weekend_stack = (
-            projected_rolling_total * projected_rolling_weekend if weekend_add else 0
+        pool = _resident_night_pool() | {name}
+        total_objective = _projected_count_objective(month_counts, pool, name, 1)
+        weekend_objective = _projected_count_objective(
+            weekend_night_counts,
+            pool,
+            name,
+            weekend_add,
         )
-
-        jitter_key = f"{month}|{shift_date.isoformat()}|{shift_type}|{name}".encode("utf-8")
-        jitter = int.from_bytes(hashlib.blake2s(jitter_key, digest_size=2).digest(), "big")
+        friday_counts = Counter({
+            worker: weekend_night_counts[worker] - saturday_night_counts[worker]
+            for worker in pool
+        })
+        friday_objective = _projected_count_objective(
+            friday_counts,
+            pool,
+            name,
+            friday_add,
+        )
+        saturday_objective = _projected_count_objective(
+            saturday_night_counts,
+            pool,
+            name,
+            saturday_add,
+        )
+        dual_pool = {
+            worker for worker in pool
+            if all(worker_shift_lut.get((worker, candidate_shift), False) for candidate_shift in RESIDENT_NIGHT_SHIFTS)
+        }
+        if name in dual_pool:
+            projected_t1 = Counter(resident_night_shift_counts["ת.מיון"])
+            projected_t2 = Counter(resident_night_shift_counts["ת.מיון 2"])
+            projected_t1[name] += int(shift_type == "ת.מיון")
+            projected_t2[name] += int(shift_type == "ת.מיון 2")
+            excess_gaps = [
+                _resident_type_excess_gap(
+                    projected_t1[worker] + projected_t2[worker],
+                    projected_t1[worker],
+                    projected_t2[worker],
+                )
+                for worker in dual_pool
+            ]
+            t1_spread, t1_square = _count_spread_and_square(projected_t1, dual_pool)
+            t2_spread, t2_square = _count_spread_and_square(projected_t2, dual_pool)
+            projected_type_objective = (
+                max(excess_gaps, default=0),
+                sum(excess_gaps),
+                t1_spread,
+                t2_spread,
+                t1_square,
+                t2_square,
+            )
+        else:
+            projected_type_objective = (0, 0, 0, 0, 0, 0)
 
         return (
-            projected_total,
-            -_resident_night_extra_capacity(name),
-            projected_weekend if weekend_add else 0,
-            projected_saturday if saturday_add else 0,
-            projected_weekend_stack,
-            projected_rolling_total,
-            projected_rolling_weekend if weekend_add else 0,
-            projected_rolling_weekend_stack,
-            *sandwich_key,
+            total_objective,
+            (*weekend_objective, *friday_objective),
+            saturday_objective,
+            sandwich_key[0],
+            sandwich_key[1:],
+            projected_type_objective,
             *_preferred_night_key(name, shift_type, shift_date),
-            projected_type_gap,
-            _resident_projected_type_compensation_key(name, shift_type),
-            projected_shift_count,
+            *_resident_personal_night_penalty(name, shift_type, shift_date),
+            -_resident_night_extra_capacity(name),
             projected_thursday,
             _glinskaya_weekend_preference(name, shift_date),
-            *_resident_personal_night_penalty(name, shift_type, shift_date),
-            jitter,
+            projected_rolling_total,
+            projected_rolling_weekend,
+            _resident_projected_type_compensation_key(name, shift_type),
+            projected_type_gap,
+            projected_shift_count,
         )
 
     def _weekend_resident_night_key(name: str, shift_date: date) -> tuple[int, ...]:
@@ -2253,6 +2471,7 @@ def auto_assign(
                         _resident_sandwich_penalty_for(w, shift_date),
                         _resident_night_spacing_penalty(w, shift_date, _last_night_before(shift_date)),
                         fairness_score(w, shift_type, shift_date, history, _last_night_before(shift_date)),
+                        _resident_assignment_jitter(w, shift_type, shift_date),
                     )
                 elif shift_type == KONEN_MION_SHIFT:
                     if shift_date.weekday() == 4:
@@ -2318,6 +2537,183 @@ def auto_assign(
             else:
                 roster.at[idx, "Assigned"] = _write_name_list(current)
         return filled
+
+    def _resident_candidate_hard_legal(idx: int, name: str) -> bool:
+        shift_date = _row_date(idx)
+        shift_type = str(roster.at[idx, "Shift"])
+        if shift_type not in RESIDENT_NIGHT_SHIFTS:
+            return False
+        if name not in active_resident_night_names or name in _assigned_names(idx):
+            return False
+        if not _can_worker_take_shift(
+            name,
+            shift_type,
+            shift_date,
+            last_night_map=_last_night_before(shift_date),
+        ):
+            return False
+        if _resident_adjacent_night_penalty(name, shift_date, daily_assignments) > 0:
+            return False
+        rest_only = {"אחרי תורנות", "חלופי", "חופש"}
+        tomorrow_shifts = daily_assignments.get(
+            shift_date + timedelta(days=1),
+            {},
+        ).get(name, set())
+        if any(shift not in rest_only for shift in tomorrow_shifts):
+            return False
+        return True
+
+    def _resident_vacancy_candidates(idx: int) -> list[str]:
+        shift_date = _row_date(idx)
+        shift_type = str(roster.at[idx, "Shift"])
+        return sorted(
+            [
+                name for name in active_resident_night_names
+                if _resident_candidate_hard_legal(idx, name)
+            ],
+            key=lambda name: (
+                _resident_night_balance_key(name, shift_type, shift_date),
+                _preferred_night_removal_penalty(name, shift_type, shift_date),
+                fairness_score(
+                    name,
+                    shift_type,
+                    shift_date,
+                    history,
+                    _last_night_before(shift_date),
+                ),
+                _resident_assignment_jitter(name, shift_type, shift_date),
+            ),
+        )
+
+    def _restore_resident_assignments(snapshot: pd.Series) -> None:
+        roster["Assigned"] = snapshot.copy()
+        _rebuild_daily_assignments_from_roster()
+        _rebuild_night_state_from_roster()
+        _rebuild_live_counters_from_roster()
+
+    def _try_resident_vacancy_chain(target_idx: int, max_evaluations: int = 300) -> bool:
+        """Fill one resident vacancy through a bounded one-displacement chain."""
+        before_missing = _resident_missing_slot_count()
+        target_date = _row_date(target_idx)
+        target_shift = str(roster.at[target_idx, "Shift"])
+        target_names = _assigned_names(target_idx)
+        evaluations = 0
+
+        donor_rows = roster[roster["Shift"].isin(RESIDENT_NIGHT_SHIFTS)].copy()
+        donor_rows["_date"] = donor_rows["Date"].map(lambda value: date.fromisoformat(str(value)))
+        for donor_idx, donor_row in donor_rows.sort_values("_date").iterrows():
+            if int(donor_idx) == int(target_idx):
+                continue
+            donor_date = donor_row["_date"]
+            donor_shift = str(donor_row.Shift)
+            donor_original = _assigned_names(int(donor_idx))
+            for donor_name in sorted(
+                donor_original,
+                key=lambda name: (
+                    _preferred_night_removal_penalty(name, donor_shift, donor_date),
+                    _resident_assignment_jitter(name, donor_shift, donor_date),
+                ),
+            ):
+                evaluations += 1
+                if evaluations > max_evaluations:
+                    return False
+                if donor_name in target_names:
+                    continue
+                if (donor_date, donor_shift, donor_name) in fixed_assignment_keys:
+                    continue
+
+                snapshot = roster["Assigned"].copy()
+                roster.at[donor_idx, "Assigned"] = _write_name_list(
+                    [name for name in donor_original if name != donor_name]
+                )
+                _rebuild_daily_assignments_from_roster()
+                _rebuild_night_state_from_roster()
+                _rebuild_live_counters_from_roster()
+
+                if not _resident_candidate_hard_legal(target_idx, donor_name):
+                    _restore_resident_assignments(snapshot)
+                    continue
+
+                roster.at[target_idx, "Assigned"] = _write_name_list(target_names + [donor_name])
+                _rebuild_daily_assignments_from_roster()
+                _rebuild_night_state_from_roster()
+                _rebuild_live_counters_from_roster()
+
+                replacements = _resident_vacancy_candidates(int(donor_idx))
+                for replacement in replacements:
+                    roster.at[donor_idx, "Assigned"] = _write_name_list(
+                        _assigned_names(int(donor_idx)) + [replacement]
+                    )
+                    _rebuild_daily_assignments_from_roster()
+                    _rebuild_night_state_from_roster()
+                    _rebuild_live_counters_from_roster()
+                    if _resident_missing_slot_count() < before_missing:
+                        logger.info(
+                            "resident vacancy chain: %s %s <- %s; %s %s <- %s",
+                            target_date.isoformat(),
+                            target_shift,
+                            donor_name,
+                            donor_date.isoformat(),
+                            donor_shift,
+                            replacement,
+                        )
+                        _forget_repair_noops()
+                        return True
+                    roster.at[donor_idx, "Assigned"] = _write_name_list(
+                        [name for name in _assigned_names(int(donor_idx)) if name != replacement]
+                    )
+                    _rebuild_daily_assignments_from_roster()
+                    _rebuild_night_state_from_roster()
+                    _rebuild_live_counters_from_roster()
+
+                _restore_resident_assignments(snapshot)
+        return False
+
+    def _repair_missing_resident_nights(max_steps: int = 20) -> int:
+        repaired = 0
+        for _ in range(max_steps):
+            missing_rows = [
+                idx for idx in resident_night_row_indexes
+                if len(_assigned_names(idx)) < _to_int(roster.at[idx, "Needed"], 0)
+            ]
+            if not missing_rows:
+                break
+            constrained = sorted(
+                missing_rows,
+                key=lambda idx: (
+                    len(_resident_vacancy_candidates(idx)),
+                    _row_date(idx),
+                    str(roster.at[idx, "Shift"]),
+                ),
+            )
+            changed = False
+            for idx in constrained:
+                candidates = _resident_vacancy_candidates(idx)
+                if candidates:
+                    pick = candidates[0]
+                    roster.at[idx, "Assigned"] = _write_name_list(_assigned_names(idx) + [pick])
+                    _rebuild_daily_assignments_from_roster()
+                    _rebuild_night_state_from_roster()
+                    _rebuild_live_counters_from_roster()
+                    repaired += 1
+                    changed = True
+                    logger.info(
+                        "resident vacancy direct refill: %s %s <- %s",
+                        _row_date(idx).isoformat(),
+                        str(roster.at[idx, "Shift"]),
+                        pick,
+                    )
+                    break
+                if _try_resident_vacancy_chain(idx):
+                    repaired += 1
+                    changed = True
+                    break
+            if not changed:
+                break
+        return repaired
+
+    def _refill_required_rows_after_cleanup() -> int:
+        return _repair_missing_resident_nights() + _refill_hard_rows_after_cleanup()
 
     def _personal_rule_rows(rule: dict[str, object]) -> pd.DataFrame:
         shift = str(rule.get("shift") or "")
@@ -2483,7 +2879,7 @@ def auto_assign(
             for name, shifts in by_worker.items():
                 if shifts.intersection(RESIDENT_NIGHT_SHIFTS):
                     by_name[name].add(d)
-        movable_dates = set(daily_assignments) if include_history else None
+        movable_dates = set(month_dates) if include_history else None
         return _resident_sandwich_pairs_from_dates(by_name, movable_dates=movable_dates)
 
     def _resident_night_row_index(d: date, name: str) -> int | None:
@@ -2501,8 +2897,10 @@ def auto_assign(
         reason: str = "resident night repair",
         allow_sandwich: bool = False,
         protect_total_objective: tuple[int, int] | None = None,
-        protect_weekend_objective: tuple[int, int] | None = None,
+        protect_weekend_objective: tuple[int, int, int, int] | None = None,
+        protect_saturday_objective: tuple[int, int] | None = None,
         protect_weekend_history: int | None = None,
+        require_preferred_names: bool = False,
     ) -> bool:
         row = roster.loc[idx]
         shift_type = str(row.Shift)
@@ -2531,7 +2929,10 @@ def auto_assign(
         non_sandwich = [
             w for w in elig
             if _resident_adjacent_night_penalty(w, shift_date, daily_assignments) == 0
-            and _resident_night_spacing_penalty(w, shift_date, effective_last_night) < 100
+            and (
+                allow_sandwich
+                or _resident_night_spacing_penalty(w, shift_date, effective_last_night) < 100
+            )
             and (allow_sandwich or _resident_sandwich_penalty_for(w, shift_date) == 0)
         ]
 
@@ -2539,10 +2940,17 @@ def auto_assign(
             preferred = [w for w in non_sandwich if w in preferred_names]
             if preferred:
                 non_sandwich = preferred
+            elif require_preferred_names:
+                roster.at[idx, "Assigned"] = _write_name_list(original)
+                _rebuild_daily_assignments_from_roster()
+                _rebuild_night_state_from_roster()
+                _rebuild_live_counters_from_roster()
+                return False
 
         if not non_sandwich:
             roster.at[idx, "Assigned"] = _write_name_list(original)
             _rebuild_daily_assignments_from_roster()
+            _rebuild_night_state_from_roster()
             _rebuild_live_counters_from_roster()
             return False
 
@@ -2558,6 +2966,7 @@ def auto_assign(
                 _resident_adjacent_night_penalty(w, shift_date, daily_assignments),
                 _resident_sandwich_balance_key(w, shift_date),
                 fairness_score(w, shift_type, shift_date, history, effective_last_night),
+                _resident_assignment_jitter(w, shift_type, shift_date),
             ),
         )
         current.append(pick)
@@ -2577,6 +2986,15 @@ def auto_assign(
         if (
             protect_weekend_objective is not None
             and _resident_weekend_objective() > protect_weekend_objective
+        ):
+            roster.at[idx, "Assigned"] = _write_name_list(original)
+            _rebuild_daily_assignments_from_roster()
+            _rebuild_night_state_from_roster()
+            _rebuild_live_counters_from_roster()
+            return False
+        if (
+            protect_saturday_objective is not None
+            and _resident_saturday_objective() > protect_saturday_objective
         ):
             roster.at[idx, "Assigned"] = _write_name_list(original)
             _rebuild_daily_assignments_from_roster()
@@ -2619,7 +3037,7 @@ def auto_assign(
                         reason="resident night sandwich repair",
                         protect_total_objective=_resident_night_total_objective(),
                         protect_weekend_objective=_resident_weekend_objective(),
-                        protect_weekend_history=_resident_weekend_history_load(),
+                        protect_saturday_objective=_resident_saturday_objective(),
                     ):
                         repaired += 1
                         changed = True
@@ -2635,9 +3053,7 @@ def auto_assign(
 
     def _try_resident_sandwich_swap(max_trials: int = 60) -> bool:
         """Swap two resident nights while preserving totals and higher priorities."""
-        current_objective = _resident_night_objective()
-        if len(current_objective) <= 12:
-            return False
+        current_metrics = _resident_priority_metrics()
 
         sandwiches = _find_resident_sandwiches(include_history=True)
         if not sandwiches:
@@ -2664,7 +3080,10 @@ def auto_assign(
             return 0
 
         def sandwich_count(name: str, dates: set[date]) -> int:
-            return len(_resident_sandwich_pairs_from_dates({name: dates}))
+            return len(_resident_sandwich_pairs_from_dates(
+                {name: dates},
+                movable_dates=set(month_dates),
+            ))
 
         candidates: list[tuple[int, int, int, int, str, int, int, str, str]] = []
         seen: set[tuple[int, str, int, str]] = set()
@@ -2677,8 +3096,6 @@ def auto_assign(
                 if (old_date, old_shift, old_name) in fixed_assignment_keys:
                     continue
                 old_preference_cost = _preferred_night_removal_penalty(old_name, old_shift, old_date)
-                if old_preference_cost >= 100:
-                    continue
 
                 for other_idx, other_row in rows.iterrows():
                     other_date = other_row["_date"]
@@ -2700,8 +3117,6 @@ def auto_assign(
                         other_preference_cost = _preferred_night_removal_penalty(
                             other_name, other_shift, other_date,
                         )
-                        if other_preference_cost >= 100:
-                            continue
                         if not worker_shift_lut.get((other_name, old_shift), False):
                             continue
                         if not worker_shift_lut.get((old_name, other_shift), False):
@@ -2778,19 +3193,22 @@ def auto_assign(
                     _resident_adjacent_night_penalty(other_name, old_date, daily_assignments) == 0
                     and _resident_adjacent_night_penalty(old_name, other_date, daily_assignments) == 0
                 )
-                candidate_objective = _resident_night_objective() if locally_legal else current_objective
+                candidate_metrics = _resident_priority_metrics() if locally_legal else current_metrics
                 if (
                     locally_legal
-                    and candidate_objective[:12] == current_objective[:12]
-                    and candidate_objective[12] < current_objective[12]
-                    and candidate_objective < current_objective
+                    and _resident_stage_improves(
+                        current_metrics,
+                        candidate_metrics,
+                        "sandwich_total",
+                    )
                 ):
                     logger.info(
                         "resident rolling sandwich total-preserving swap: "
                         "%s %s %s <-> %s %s %s sandwiches %d -> %d",
                         old_date.isoformat(), old_shift, old_name,
                         other_date.isoformat(), other_shift, other_name,
-                        current_objective[12], candidate_objective[12],
+                        current_metrics.sandwich_total,
+                        candidate_metrics.sandwich_total,
                     )
                     return True
 
@@ -2825,7 +3243,53 @@ def auto_assign(
         assigned_names = set(month_counts) | set(weekend_night_counts)
         for counter in resident_night_shift_counts.values():
             assigned_names.update(counter)
-        return active_resident_night_names | assigned_names
+        return resident_fairness_pool | assigned_names
+
+    def _refresh_resident_fairness_pool() -> set[str]:
+        """Keep only residents who are assigned or can receive a movable night."""
+        assigned_names = {
+            name
+            for counter in resident_night_shift_counts.values()
+            for name, count in counter.items()
+            if count > 0
+        }
+        reachable = set(assigned_names)
+        candidate_names = active_resident_night_names - assigned_names
+        if candidate_names:
+            rows = roster[roster["Shift"].isin(RESIDENT_NIGHT_SHIFTS)]
+            for idx, row in rows.iterrows():
+                shift_date = _row_date(idx)
+                shift_type = str(row.Shift)
+                assigned_here = _name_list(row.Assigned)
+                if assigned_here and all(
+                    (shift_date, shift_type, name) in fixed_assignment_keys
+                    for name in assigned_here
+                ):
+                    continue
+                effective_last_night = _last_night_before(shift_date)
+                for name in list(candidate_names - reachable):
+                    if _can_worker_take_shift(
+                        name,
+                        shift_type,
+                        shift_date,
+                        last_night_map=effective_last_night,
+                    ):
+                        reachable.add(name)
+                if candidate_names <= reachable:
+                    break
+
+        excluded = active_resident_night_names - reachable
+        if reachable != resident_fairness_pool or excluded != resident_fairness_pool_excluded:
+            logger.info(
+                "Resident effective fairness pool: active=%s excluded_unreachable=%s",
+                ", ".join(sorted(reachable)) or "none",
+                ", ".join(sorted(excluded)) or "none",
+            )
+        resident_fairness_pool.clear()
+        resident_fairness_pool.update(reachable)
+        resident_fairness_pool_excluded.clear()
+        resident_fairness_pool_excluded.update(excluded)
+        return set(resident_fairness_pool)
 
     def _resident_night_total_counts() -> Counter:
         pool = _resident_night_pool()
@@ -2835,10 +3299,23 @@ def auto_assign(
         pool = _resident_night_pool()
         return _count_spread_and_square(_current_resident_total_counts(pool), pool)
 
-    def _resident_weekend_objective() -> tuple[int, int]:
+    def _resident_weekend_objective() -> tuple[int, int, int, int]:
+        pool = _resident_night_pool()
+        weekend_objective = _count_spread_and_square(
+            Counter({name: weekend_night_counts[name] for name in pool}),
+            pool,
+        )
+        friday_counts = Counter({
+            name: weekend_night_counts[name] - saturday_night_counts[name]
+            for name in pool
+        })
+        friday_objective = _count_spread_and_square(friday_counts, pool)
+        return (*weekend_objective, *friday_objective)
+
+    def _resident_saturday_objective() -> tuple[int, int]:
         pool = _resident_night_pool()
         return _count_spread_and_square(
-            Counter({name: weekend_night_counts[name] for name in pool}),
+            Counter({name: saturday_night_counts[name] for name in pool}),
             pool,
         )
 
@@ -2864,16 +3341,23 @@ def auto_assign(
         return (max(values) - min(values), sum(v * v for v in values))
 
     def _resident_night_shift_balance_key(pool: set[str]) -> tuple[int, int, int, int, int, int]:
+        pool = {
+            name for name in pool
+            if all(worker_shift_lut.get((name, shift), False) for shift in RESIDENT_NIGHT_SHIFTS)
+        }
         shift_counters = list(resident_night_shift_counts.values())
         if not pool or len(shift_counters) < 2:
             return (0, 0, 0, 0, 0, 0)
         t1, t2 = shift_counters[:2]
-        diffs = [abs(t1[name] - t2[name]) for name in pool]
+        excess_gaps = [
+            _resident_type_excess_gap(month_counts[name], t1[name], t2[name])
+            for name in pool
+        ]
         t1_spread, t1_square = _count_spread_and_square(t1, pool)
         t2_spread, t2_square = _count_spread_and_square(t2, pool)
         return (
-            max(diffs),
-            sum(diffs),
+            max(excess_gaps),
+            sum(excess_gaps),
             t1_spread,
             t2_spread,
             t1_square,
@@ -2921,11 +3405,12 @@ def auto_assign(
             )
             if not burden:
                 continue
-            delta = (
-                resident_night_shift_counts["ת.מיון"][name]
-                - resident_night_shift_counts["ת.מיון 2"][name]
+            penalty += _resident_type_compensation_distance(
+                month_counts[name],
+                resident_night_shift_counts["ת.מיון"][name],
+                resident_night_shift_counts["ת.מיון 2"][name],
+                burden,
             )
-            penalty += burden * delta
         return penalty
 
     def _resident_current_hardship(name: str, pool: set[str] | None = None) -> int:
@@ -2952,58 +3437,288 @@ def auto_assign(
             burden = _resident_current_hardship(name, pool)
             if not burden:
                 continue
-            delta = (
-                resident_night_shift_counts["ת.מיון"][name]
-                - resident_night_shift_counts["ת.מיון 2"][name]
+            penalty += _resident_type_compensation_distance(
+                month_counts[name],
+                resident_night_shift_counts["ת.מיון"][name],
+                resident_night_shift_counts["ת.מיון 2"][name],
+                burden,
             )
-            penalty += burden * delta
         return penalty
 
-    def _resident_night_objective() -> tuple[int, ...]:
+    def _resident_missing_slot_count() -> int:
+        return sum(
+            max(_to_int(roster.at[idx, "Needed"], 0) - len(_assigned_names(idx)), 0)
+            for idx in resident_night_row_indexes
+        )
+
+    def _resident_priority_metrics() -> ResidentNightMetrics:
         _rebuild_daily_assignments_from_roster()
         _rebuild_live_counters_from_roster()
         pool = _resident_night_pool()
         current_total_counts = _current_resident_total_counts(pool)
-        current_weekend_counts = Counter({name: weekend_night_counts[name] for name in pool})
-        current_saturday_counts = Counter({name: saturday_night_counts[name] for name in pool})
-        rolling_total_counts = _rolling_resident_total_counts(pool)
-        rolling_weekend_counts = _rolling_resident_weekend_counts(pool)
         total_spread, total_square = _count_spread_and_square(current_total_counts, pool)
-        weekend_spread, weekend_square = _count_spread_and_square(current_weekend_counts, pool)
-        saturday_spread, saturday_square = _count_spread_and_square(current_saturday_counts, pool)
-        rolling_total_spread, rolling_total_square = _count_spread_and_square(rolling_total_counts, pool)
-        rolling_weekend_spread, rolling_weekend_square = _count_spread_and_square(rolling_weekend_counts, pool)
-        weekend_stack = _resident_weekend_stack_objective(pool)
-        shift_balance = _resident_night_shift_balance_key(pool)
-        thursday_balance = _count_spread_and_square(thursday_night_counts, pool)
-        return (
-            total_spread,
-            total_square,
-            weekend_spread,
-            weekend_square,
-            saturday_spread,
-            saturday_square,
-            *weekend_stack,
-            rolling_total_spread,
-            rolling_total_square,
-            rolling_weekend_spread,
-            rolling_weekend_square,
-            _resident_rolling_sandwich_total(pool),
-            *_preferred_night_miss_objective(),
-            *shift_balance,
-            _resident_type_compensation_total(),
-            _resident_night_personal_preference_total(),
-            *thursday_balance,
+        actionable_sandwiches = _resident_actionable_sandwich_counts()
+        return ResidentNightMetrics(
+            missing=_resident_missing_slot_count(),
+            total=(total_spread, total_square),
+            weekend_friday=_resident_weekend_objective(),
+            saturday=_resident_saturday_objective(),
+            sandwich_total=sum(actionable_sandwiches[name] for name in pool),
+            sandwich_distribution=_resident_sandwich_distribution_objective(
+                actionable_sandwiches,
+                pool,
+            ),
+            shift_type=_resident_night_shift_balance_key(pool),
         )
 
-    def _resident_hard_objective(objective: tuple[int, ...]) -> tuple[int, ...]:
-        return objective[:13]
+    def _resident_night_objective() -> ResidentNightObjective:
+        core = _resident_priority_metrics()
+        pool = _resident_night_pool()
+        rolling_total = _resident_rolling_total_objective()
+        rolling_weekend = _count_spread_and_square(_rolling_resident_weekend_counts(pool), pool)
+        return ResidentNightObjective(
+            core=core,
+            preferred=_preferred_night_miss_objective(),
+            personal=_resident_night_personal_preference_total(),
+            thursday=_count_spread_and_square(thursday_night_counts, pool),
+            history=(
+                *rolling_total,
+                *rolling_weekend,
+                _resident_rolling_sandwich_total(pool),
+            ),
+        )
 
-    def _resident_preference_objective(objective: tuple[int, ...]) -> tuple[int, ...]:
-        return objective[13:17]
+    def _resident_hard_objective(objective: ResidentNightObjective) -> tuple[object, ...]:
+        return _resident_core_key(objective.core)[:-1]
 
-    def _resident_shift_type_objective(objective: tuple[int, ...]) -> tuple[int, ...]:
-        return objective[17:23]
+    def _resident_preference_objective(objective: ResidentNightObjective) -> tuple[int, int, int, int]:
+        return objective.preferred
+
+    def _resident_shift_type_objective(objective: ResidentNightObjective) -> tuple[int, int, int, int, int, int]:
+        return objective.core.shift_type
+
+    def _try_resident_priority_swap(stage: str, max_evaluations: int = 60) -> bool:
+        """Try a legal two-resident swap that improves one protected stage."""
+        before = _resident_priority_metrics()
+        rows = roster[roster["Shift"].isin(RESIDENT_NIGHT_SHIFTS)].copy()
+        if rows.empty:
+            return False
+        rows["_date"] = rows["Date"].map(lambda value: date.fromisoformat(str(value)))
+
+        assignments: list[tuple[int, date, str, str]] = []
+        for idx, row in rows.iterrows():
+            d = row["_date"]
+            shift = str(row.Shift)
+            for name in _name_list(row.Assigned):
+                assignments.append((int(idx), d, shift, name))
+
+        pool = _resident_night_pool()
+        friday_counts = Counter({
+            name: weekend_night_counts[name] - saturday_night_counts[name]
+            for name in pool
+        })
+        sandwich_counts = _resident_actionable_sandwich_counts()
+        sandwich_endpoints = {
+            (name, endpoint)
+            for name, first, second in _find_resident_sandwiches(include_history=True)
+            for endpoint in (first, second)
+        }
+
+        candidates: list[tuple[int, int, int, int, str, int, int, str, str]] = []
+        seen: set[tuple[int, str, int, str]] = set()
+        for a_pos, (a_idx, a_date, a_shift, a_name) in enumerate(assignments):
+            if (a_date, a_shift, a_name) in fixed_assignment_keys:
+                continue
+            for b_idx, b_date, b_shift, b_name in assignments[a_pos + 1:]:
+                if a_idx == b_idx or a_name == b_name:
+                    continue
+                if (b_date, b_shift, b_name) in fixed_assignment_keys:
+                    continue
+                key = (a_idx, a_name, b_idx, b_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                a_weekday = a_date.weekday()
+                b_weekday = b_date.weekday()
+                potential_gain = 0
+                if stage == "weekend_friday":
+                    a_weekend = a_weekday in (4, 5)
+                    b_weekend = b_weekday in (4, 5)
+                    if a_weekend != b_weekend:
+                        weekend_name = a_name if a_weekend else b_name
+                        weekday_name = b_name if a_weekend else a_name
+                        potential_gain = (
+                            weekend_night_counts[weekend_name]
+                            - weekend_night_counts[weekday_name]
+                        )
+                    elif {a_weekday, b_weekday} == {4, 5}:
+                        friday_name = a_name if a_weekday == 4 else b_name
+                        saturday_name = b_name if a_weekday == 4 else a_name
+                        potential_gain = friday_counts[friday_name] - friday_counts[saturday_name]
+                    else:
+                        continue
+                    if potential_gain <= 0:
+                        continue
+                elif stage == "saturday":
+                    if {a_weekday, b_weekday} != {4, 5}:
+                        continue
+                    saturday_name = a_name if a_weekday == 5 else b_name
+                    friday_name = b_name if a_weekday == 5 else a_name
+                    potential_gain = (
+                        saturday_night_counts[saturday_name]
+                        - saturday_night_counts[friday_name]
+                    )
+                    if potential_gain <= 0:
+                        continue
+                elif stage in {"sandwich_total", "sandwich_distribution"}:
+                    if a_date == b_date:
+                        continue
+                    if stage == "sandwich_total":
+                        if (a_name, a_date) not in sandwich_endpoints and (b_name, b_date) not in sandwich_endpoints:
+                            continue
+                        potential_gain = sandwich_counts[a_name] + sandwich_counts[b_name]
+                    else:
+                        potential_gain = abs(sandwich_counts[a_name] - sandwich_counts[b_name])
+                        if potential_gain < 2:
+                            continue
+                elif stage == "shift_type":
+                    if a_shift == b_shift:
+                        continue
+                    a_t1 = resident_night_shift_counts["ת.מיון"][a_name]
+                    a_t2 = resident_night_shift_counts["ת.מיון 2"][a_name]
+                    b_t1 = resident_night_shift_counts["ת.מיון"][b_name]
+                    b_t2 = resident_night_shift_counts["ת.מיון 2"][b_name]
+                    if a_shift == "ת.מיון":
+                        useful = a_t1 > a_t2 and b_t2 > b_t1
+                    else:
+                        useful = a_t2 > a_t1 and b_t1 > b_t2
+                    if not useful:
+                        continue
+                    potential_gain = abs(a_t1 - a_t2) + abs(b_t1 - b_t2)
+                else:
+                    raise ValueError(f"Unsupported resident swap stage: {stage}")
+
+                candidates.append((
+                    -potential_gain,
+                    _preferred_night_removal_penalty(a_name, a_shift, a_date)
+                    + _preferred_night_removal_penalty(b_name, b_shift, b_date),
+                    0 if a_shift == b_shift else 1,
+                    abs((a_date - b_date).days),
+                    min(a_date, b_date).isoformat(),
+                    a_idx,
+                    b_idx,
+                    a_name,
+                    b_name,
+                ))
+
+        evaluations = 0
+        for _, _, _, _, _, a_idx, b_idx, a_name, b_name in sorted(candidates):
+            evaluations += 1
+            if evaluations > max_evaluations:
+                break
+            a_date = _row_date(a_idx)
+            b_date = _row_date(b_idx)
+            a_shift = str(roster.at[a_idx, "Shift"])
+            b_shift = str(roster.at[b_idx, "Shift"])
+            original_a = _assigned_names(a_idx)
+            original_b = _assigned_names(b_idx)
+            if a_name not in original_a or b_name not in original_b:
+                continue
+
+            snapshot = roster["Assigned"].copy()
+            roster.at[a_idx, "Assigned"] = _write_name_list(
+                [name for name in original_a if name != a_name]
+            )
+            roster.at[b_idx, "Assigned"] = _write_name_list(
+                [name for name in original_b if name != b_name]
+            )
+            _rebuild_daily_assignments_from_roster()
+            _rebuild_night_state_from_roster()
+            _rebuild_live_counters_from_roster()
+
+            if not (
+                _resident_candidate_hard_legal(a_idx, b_name)
+                and _resident_candidate_hard_legal(b_idx, a_name)
+            ):
+                _restore_resident_assignments(snapshot)
+                continue
+
+            roster.at[a_idx, "Assigned"] = _write_name_list(_assigned_names(a_idx) + [b_name])
+            roster.at[b_idx, "Assigned"] = _write_name_list(_assigned_names(b_idx) + [a_name])
+            _rebuild_daily_assignments_from_roster()
+            _rebuild_night_state_from_roster()
+            _rebuild_live_counters_from_roster()
+            after = _resident_priority_metrics()
+            distribution_total_unchanged = (
+                stage != "sandwich_distribution"
+                or after.sandwich_total == before.sandwich_total
+            )
+            if distribution_total_unchanged and _resident_stage_improves(before, after, stage):
+                logger.info(
+                    "resident %s swap: %s %s %s <-> %s %s %s metrics %s -> %s",
+                    stage,
+                    a_date.isoformat(),
+                    a_shift,
+                    a_name,
+                    b_date.isoformat(),
+                    b_shift,
+                    b_name,
+                    before,
+                    after,
+                )
+                _forget_repair_noops()
+                return True
+            _restore_resident_assignments(snapshot)
+        return False
+
+    def _repair_resident_priority_swaps(
+        stage: str,
+        *,
+        max_steps: int,
+        max_evaluations: int = 60,
+    ) -> int:
+        label = f"resident_priority_{stage}"
+        if _repair_noop_cached(label):
+            return 0
+        repaired = 0
+        for _ in range(max_steps):
+            if not _try_resident_priority_swap(stage, max_evaluations=max_evaluations):
+                _remember_repair_noop(label)
+                break
+            repaired += 1
+        return repaired
+
+    def _repair_resident_saturday_balance(max_steps: int = 12) -> int:
+        return _repair_resident_priority_swaps(
+            "saturday",
+            max_steps=max_steps,
+        )
+
+    def _repair_resident_sandwich_distribution(max_steps: int = 10) -> int:
+        return _repair_resident_priority_swaps(
+            "sandwich_distribution",
+            max_steps=max_steps,
+        )
+
+    def _run_resident_stage_repair(stage: str, repair: Callable[[], int]) -> int:
+        """Rollback a legacy repair if its final result violates the priority stage."""
+        before = _resident_priority_metrics()
+        snapshot = roster["Assigned"].copy()
+        changed = repair()
+        if not changed:
+            return 0
+        after = _resident_priority_metrics()
+        if _resident_stage_improves(before, after, stage):
+            return changed
+        _restore_resident_assignments(snapshot)
+        logger.info(
+            "Rolled back resident %s repair that did not preserve the priority order: %s -> %s",
+            stage,
+            before,
+            after,
+        )
+        return 0
 
     def _mark_missing_required_rows() -> int:
         marked = 0
@@ -3025,6 +3740,8 @@ def auto_assign(
     def _legal_resident_replacement_candidates(
         idx: int,
         old_name: str,
+        *,
+        allow_sandwich: bool = False,
     ) -> list[str]:
         row = roster.loc[idx]
         shift_type = str(row.Shift)
@@ -3049,7 +3766,10 @@ def auto_assign(
             if w not in current
             and w != old_name
             and _resident_adjacent_night_penalty(w, shift_date, daily_assignments) == 0
-            and _resident_night_spacing_penalty(w, shift_date, effective_last_night) < 100
+            and (
+                allow_sandwich
+                or _resident_night_spacing_penalty(w, shift_date, effective_last_night) < 100
+            )
         ]
 
         roster.at[idx, "Assigned"] = _write_name_list(original)
@@ -3510,14 +4230,9 @@ def auto_assign(
                 )
                 new_rolling_weekend = _count_spread_and_square(_rolling_resident_weekend_counts(pool), pool)
                 new_sandwiches = _resident_rolling_sandwich_total(pool)
-                sandwich_cost_ok = (
-                    new_sandwiches <= current_sandwiches
-                    or (
-                        current_weekend_gap >= 2
-                        and new_weekend < current_weekend
-                        and new_sandwiches <= current_sandwiches + 1
-                    )
-                )
+                # Sandwiches are lower priority than weekend/Friday balance.
+                # Candidate ordering and later sandwich passes minimize any cost.
+                sandwich_cost_ok = True
                 if (
                     (
                         new_weekend < current_weekend
@@ -3594,14 +4309,8 @@ def auto_assign(
                 new_rolling_weekend = _count_spread_and_square(_rolling_resident_weekend_counts(pool), pool)
                 new_weekend_history = _resident_weekend_history_load(pool)
                 new_sandwiches = _resident_rolling_sandwich_total(pool)
-                sandwich_cost_ok = (
-                    new_sandwiches <= current_sandwiches
-                    or (
-                        current_weekend_gap >= 2
-                        and new_weekend < current_weekend
-                        and new_sandwiches <= current_sandwiches + 1
-                    )
-                )
+                # Sandwiches are lower priority than weekend/Friday balance.
+                sandwich_cost_ok = True
                 if (
                     (
                         new_weekend < current_weekend
@@ -3773,9 +4482,10 @@ def auto_assign(
 
     def _resident_type_gap_within(limit: int = 2) -> bool:
         for name in _resident_night_pool():
-            gap = abs(
-                resident_night_shift_counts["ת.מיון"][name]
-                - resident_night_shift_counts["ת.מיון 2"][name]
+            gap = _resident_type_excess_gap(
+                month_counts[name],
+                resident_night_shift_counts["ת.מיון"][name],
+                resident_night_shift_counts["ת.מיון 2"][name],
             )
             if gap > limit:
                 return False
@@ -3784,12 +4494,12 @@ def auto_assign(
     def _try_resident_compensation_type_swap() -> bool:
         """
         Prefer ת.מיון 2 as compensation for residents carrying heavier total or
-        weekend load. Unlike pure type balancing, this can accept a 2-vs-4 split
-        when higher-priority fairness is protected.
+        weekend load without worsening anyone's parity-adjusted type balance.
         """
         current_objective = _resident_night_objective()
         current_hard = _resident_hard_objective(current_objective)
         current_preference = _resident_preference_objective(current_objective)
+        current_shift_balance = _resident_night_shift_balance_key(_resident_night_pool())
         current_compensation = _resident_type_compensation_total()
         current_weekend_history = _resident_weekend_history_load()
         rows = roster[roster["Shift"].isin(RESIDENT_NIGHT_SHIFTS)].copy()
@@ -3890,7 +4600,7 @@ def auto_assign(
                     _resident_hard_objective(candidate_objective) <= current_hard
                     and _resident_preference_objective(candidate_objective) <= current_preference
                     and _resident_weekend_history_load() <= current_weekend_history
-                    and _resident_type_gap_within(limit=2)
+                    and _resident_night_shift_balance_key(_resident_night_pool()) <= current_shift_balance
                     and _resident_type_compensation_total() < current_compensation
                 ):
                     _rebuild_daily_assignments_from_roster()
@@ -4276,14 +4986,8 @@ def auto_assign(
             _forget_repair_noops()
         return repaired
 
-    def _resident_higher_priority_objective() -> tuple[tuple[int, int], tuple[int, int], int, tuple[int, int, int, int, int, int]]:
-        pool = _resident_night_pool()
-        return (
-            _resident_night_total_objective(),
-            _resident_weekend_objective(),
-            _resident_rolling_sandwich_total(pool),
-            _resident_night_shift_balance_key(pool),
-        )
+    def _resident_higher_priority_objective() -> tuple[object, ...]:
+        return _resident_core_key(_resident_priority_metrics())
 
     def _try_resident_thursday_swap(*, protect_higher_priorities: bool = False) -> bool:
         pool = {
@@ -4434,23 +5138,58 @@ def auto_assign(
         thursday_steps: int = 3,
     ) -> int:
         _forget_repair_noops()
+        _refresh_resident_fairness_pool()
         repaired = 0
         for _ in range(rounds):
+            _refresh_resident_fairness_pool()
             before = repaired
-            repaired += _repair_resident_night_balance()
-            repaired += _repair_resident_rolling_total_balance()
-            repaired += _repair_resident_weekend_balance(max_steps=weekend_steps)
-            repaired += _repair_resident_sandwiches()
-            repaired += _repair_resident_sandwich_swaps()
-            repaired += _repair_resident_weekend_balance(max_steps=weekend_steps)
-            repaired += _optimize_resident_night_assignments(max_steps=type_steps)
-            repaired += _repair_resident_weekend_balance(max_steps=weekend_steps)
-            repaired += _repair_resident_rolling_total_balance()
-            repaired += _repair_resident_thursday_balance(max_steps=thursday_steps)
+            repaired += _repair_missing_resident_nights()
+            repaired += _run_resident_stage_repair(
+                "total",
+                _repair_resident_night_balance,
+            )
+            repaired += _run_resident_stage_repair(
+                "weekend_friday",
+                lambda: _repair_resident_weekend_balance(
+                    max_steps=weekend_steps,
+                    use_cache=False,
+                ),
+            )
+            repaired += _repair_resident_priority_swaps(
+                "weekend_friday",
+                max_steps=min(12, weekend_steps),
+            )
+            repaired += _repair_resident_saturday_balance(
+                max_steps=min(8, max(4, weekend_steps // 2)),
+            )
+            repaired += _run_resident_stage_repair(
+                "sandwich_total",
+                _repair_resident_sandwiches,
+            )
+            repaired += _run_resident_stage_repair(
+                "sandwich_total",
+                lambda: _repair_resident_sandwich_swaps(
+                    max_steps=10,
+                    use_cache=False,
+                ),
+            )
+            repaired += _repair_resident_priority_swaps(
+                "sandwich_total",
+                max_steps=8,
+            )
+            repaired += _repair_resident_sandwich_distribution(max_steps=8)
+            repaired += _repair_resident_priority_swaps(
+                "shift_type",
+                max_steps=min(8, max(2, type_steps * 2)),
+            )
+            repaired += _repair_resident_thursday_final(max_steps=thursday_steps)
             if repaired == before:
                 break
         if _resident_night_total_objective()[0] > 1:
-            repaired += _repair_resident_night_balance()
+            repaired += _run_resident_stage_repair(
+                "total",
+                _repair_resident_night_balance,
+            )
         return repaired
 
     def _senior_other_friday_day_dates(name: str, d: date) -> set[date]:
@@ -4716,6 +5455,174 @@ def auto_assign(
             repaired += 1
         return repaired
 
+    def _try_resident_night_balance_chain(max_evaluations: int = 300) -> bool:
+        """
+        Try a two-hop transfer when no direct high-to-low replacement is legal.
+
+        A loses high_name to mid_name, while B loses mid_name to low_name.  The
+        intermediate resident's total is unchanged; the high resident loses one
+        night and the low resident gains one.  All final assignments are checked
+        with the same eligibility and rest rules used by the normal scheduler.
+        """
+        pool = _resident_night_pool()
+        counts = _resident_night_total_counts()
+        if not pool or not counts:
+            return False
+        max_count = max(counts.values())
+        min_count = min(counts.values())
+        if max_count - min_count <= 1:
+            return False
+
+        high_names = {name for name in pool if counts[name] == max_count}
+        low_names = {name for name in pool if counts[name] <= max_count - 2}
+        if not high_names or not low_names:
+            return False
+
+        before_total = _resident_night_total_objective()
+        before_weekend = _resident_weekend_objective()
+        before_weekend_history = _resident_weekend_history_load()
+        rows = roster[roster["Shift"].isin(RESIDENT_NIGHT_SHIFTS)].copy()
+        candidates: list[tuple[int, int, str, str, int, int, str, str, str]] = []
+
+        for a_idx, a_row in rows.iterrows():
+            a_date = _row_date(a_idx)
+            a_shift = str(a_row.Shift)
+            a_names = _name_list(a_row.Assigned)
+            for high_name in a_names:
+                if high_name not in high_names:
+                    continue
+                if (a_date, a_shift, high_name) in fixed_assignment_keys:
+                    continue
+                high_removal_penalty = _preferred_night_removal_penalty(
+                    high_name, a_shift, a_date
+                )
+
+                for b_idx, b_row in rows.iterrows():
+                    if b_idx == a_idx:
+                        continue
+                    b_date = _row_date(b_idx)
+                    b_shift = str(b_row.Shift)
+                    same_weekend_class = int(
+                        (a_date.weekday() in (4, 5)) != (b_date.weekday() in (4, 5))
+                    )
+                    for mid_name in _name_list(b_row.Assigned):
+                        if mid_name == high_name or mid_name in low_names or mid_name not in pool:
+                            continue
+                        if mid_name in a_names:
+                            continue
+                        if (b_date, b_shift, mid_name) in fixed_assignment_keys:
+                            continue
+                        mid_removal_penalty = _preferred_night_removal_penalty(
+                            mid_name, b_shift, b_date
+                        )
+                        if eligibility_reason(mid_name, a_date.isoformat(), a_shift) is not None:
+                            continue
+
+                        for low_name in low_names:
+                            if low_name in a_names or low_name in _name_list(b_row.Assigned):
+                                continue
+                            if eligibility_reason(low_name, b_date.isoformat(), b_shift) is not None:
+                                continue
+                            candidates.append((
+                                same_weekend_class,
+                                high_removal_penalty + mid_removal_penalty,
+                                a_date.isoformat(),
+                                b_date.isoformat(),
+                                a_idx,
+                                b_idx,
+                                high_name,
+                                mid_name,
+                                low_name,
+                            ))
+
+        candidates.sort()
+        if not candidates:
+            return False
+
+        for protect_weekends in (True, False):
+            evaluated = 0
+            for (
+                _, _, _, _, a_idx, b_idx, high_name, mid_name, low_name
+            ) in candidates:
+                evaluated += 1
+                if evaluated > max_evaluations:
+                    logger.debug(
+                        "resident night two-hop search reached evaluation limit (%d)",
+                        max_evaluations,
+                    )
+                    break
+
+                a_date = _row_date(a_idx)
+                b_date = _row_date(b_idx)
+                a_shift = str(roster.at[a_idx, "Shift"])
+                b_shift = str(roster.at[b_idx, "Shift"])
+                original_a = _name_list(roster.at[a_idx, "Assigned"])
+                original_b = _name_list(roster.at[b_idx, "Assigned"])
+                current_a = [name for name in original_a if name != high_name]
+                current_b = [name for name in original_b if name != mid_name]
+
+                roster.at[a_idx, "Assigned"] = _write_name_list(current_a)
+                roster.at[b_idx, "Assigned"] = _write_name_list(current_b)
+                _rebuild_daily_assignments_from_roster()
+                _rebuild_night_state_from_roster()
+                _rebuild_live_counters_from_roster()
+
+                mid_last_night = _last_night_before(a_date)
+                low_last_night = _last_night_before(b_date)
+                mid_can_take_a = (
+                    _can_worker_take_shift(
+                        mid_name,
+                        a_shift,
+                        a_date,
+                        last_night_map=mid_last_night,
+                    )
+                    and _resident_adjacent_night_penalty(mid_name, a_date, daily_assignments) == 0
+                    and _resident_night_spacing_penalty(mid_name, a_date, mid_last_night) < 100
+                )
+                low_can_take_b = (
+                    _can_worker_take_shift(
+                        low_name,
+                        b_shift,
+                        b_date,
+                        last_night_map=low_last_night,
+                    )
+                    and _resident_adjacent_night_penalty(low_name, b_date, daily_assignments) == 0
+                    and _resident_night_spacing_penalty(low_name, b_date, low_last_night) < 100
+                )
+
+                if mid_can_take_a and low_can_take_b:
+                    roster.at[a_idx, "Assigned"] = _write_name_list(current_a + [mid_name])
+                    roster.at[b_idx, "Assigned"] = _write_name_list(current_b + [low_name])
+                    _rebuild_daily_assignments_from_roster()
+                    _rebuild_night_state_from_roster()
+                    _rebuild_live_counters_from_roster()
+                    total_improved = _resident_night_total_objective() < before_total
+                    weekends_protected = (
+                        not protect_weekends
+                        or (
+                            _resident_weekend_objective() <= before_weekend
+                            and _resident_weekend_history_load() <= before_weekend_history
+                        )
+                    )
+                    if total_improved and weekends_protected:
+                        logger.info(
+                            "resident night two-hop balance: %s %s %s -> %s; "
+                            "%s %s %s -> %s objective %s -> %s",
+                            a_date.isoformat(), a_shift, high_name, mid_name,
+                            b_date.isoformat(), b_shift, mid_name, low_name,
+                            before_total, _resident_night_total_objective(),
+                        )
+                        _forget_repair_noops()
+                        return True
+
+                roster.at[a_idx, "Assigned"] = _write_name_list(original_a)
+                roster.at[b_idx, "Assigned"] = _write_name_list(original_b)
+                _rebuild_daily_assignments_from_roster()
+                _rebuild_night_state_from_roster()
+                _rebuild_live_counters_from_roster()
+
+        return False
+
     def _repair_resident_night_balance() -> int:
         label = "resident_night_balance"
         if _repair_noop_cached(label):
@@ -4723,6 +5630,7 @@ def auto_assign(
         repaired = 0
         seen_states: set[tuple[tuple[str, int], ...]] = set()
         for _ in range(20):
+            _refresh_resident_fairness_pool()
             counts = _resident_night_total_counts()
             if not counts:
                 _remember_repair_noop(label)
@@ -4739,42 +5647,66 @@ def auto_assign(
                 break
 
             high_names = [name for name, count in counts.items() if count == max_count]
-            low_names = {name for name, count in counts.items() if count == min_count}
+            low_levels = sorted({count for count in counts.values() if count <= max_count - 2})
             before_objective = _resident_night_total_objective()
             changed = False
 
-            for high_name in sorted(high_names, key=lambda n: (-counts[n], -month_counts[n], n)):
-                high_rows = roster[
-                    (roster["Shift"].isin(["ת.מיון", "ת.מיון 2"]))
-                    & (roster["Assigned"].astype(str).map(lambda cell: high_name in _name_list(cell)))
-                ].copy()
-                high_rows["_weekday"] = high_rows["Date"].map(lambda x: date.fromisoformat(str(x)).weekday())
-                for idx, _ in high_rows.sort_values(["_weekday", "Date"], ascending=[False, False]).iterrows():
-                    assigned_snapshot = roster["Assigned"].copy()
-                    if _try_replace_resident_night(
-                        idx,
-                        high_name,
-                        preferred_names=low_names,
-                        reason="resident night balance repair",
-                        allow_sandwich=True,
-                        protect_weekend_objective=_resident_weekend_objective(),
-                        protect_weekend_history=_resident_weekend_history_load(),
-                    ):
-                        after_objective = _resident_night_total_objective()
-                        if after_objective < before_objective:
-                            repaired += 1
-                            changed = True
-                            _forget_repair_noops()
+            # Preserve weekends first. If no such transfer exists, total balance
+            # still wins and the later weekend pass repairs the secondary metric.
+            for protect_weekends in (True, False):
+                for low_level in low_levels:
+                    low_names = {name for name, count in counts.items() if count == low_level}
+                    for high_name in sorted(high_names, key=lambda n: (-counts[n], -month_counts[n], n)):
+                        high_rows = roster[
+                            (roster["Shift"].isin(["ת.מיון", "ת.מיון 2"]))
+                            & (roster["Assigned"].astype(str).map(lambda cell: high_name in _name_list(cell)))
+                        ].copy()
+                        high_rows["_weekday"] = high_rows["Date"].map(
+                            lambda x: date.fromisoformat(str(x)).weekday()
+                        )
+                        for idx, _ in high_rows.sort_values(
+                            ["_weekday", "Date"], ascending=[False, False]
+                        ).iterrows():
+                            shift_date = _row_date(idx)
+                            shift_type = str(roster.at[idx, "Shift"])
+                            assigned_snapshot = roster["Assigned"].copy()
+                            if _try_replace_resident_night(
+                                idx,
+                                high_name,
+                                preferred_names=low_names,
+                                reason="resident night balance repair",
+                                allow_sandwich=True,
+                                protect_weekend_objective=(
+                                    _resident_weekend_objective() if protect_weekends else None
+                                ),
+                                protect_weekend_history=(
+                                    _resident_weekend_history_load() if protect_weekends else None
+                                ),
+                                require_preferred_names=True,
+                            ):
+                                after_objective = _resident_night_total_objective()
+                                if after_objective < before_objective:
+                                    repaired += 1
+                                    changed = True
+                                    _forget_repair_noops()
+                                    break
+                                roster["Assigned"] = assigned_snapshot
+                                _rebuild_daily_assignments_from_roster()
+                                _rebuild_night_state_from_roster()
+                                _rebuild_live_counters_from_roster()
+                        if changed:
                             break
-                        roster["Assigned"] = assigned_snapshot
-                        _rebuild_daily_assignments_from_roster()
-                        _rebuild_night_state_from_roster()
-                        _rebuild_live_counters_from_roster()
+                    if changed:
+                        break
                 if changed:
                     break
 
             if not changed:
                 if _try_best_resident_night_improvement():
+                    repaired += 1
+                    _forget_repair_noops()
+                    continue
+                if _try_resident_night_balance_chain():
                     repaired += 1
                     _forget_repair_noops()
                     continue
@@ -4897,6 +5829,135 @@ def auto_assign(
                     break
             if not changed:
                 break
+        return repaired
+
+    def _senior_on_call_weekend_objective(pool: set[str]) -> tuple[int, int, int, int]:
+        if not pool:
+            return (0, 0, 0, 0)
+        current = Counter({name: konen_weekend_counts[name] for name in pool})
+        rolling = Counter({
+            name: previous_senior_weekend_counts[name] + konen_weekend_counts[name]
+            for name in pool
+        })
+        current_spread, current_square = _count_spread_and_square(current, pool)
+        rolling_spread, rolling_square = _count_spread_and_square(rolling, pool)
+        return (current_spread, current_square, rolling_spread, rolling_square)
+
+    def _try_senior_on_call_weekend_swap() -> bool:
+        pool = {
+            name for name in _senior_on_call_pool()
+            if konen_month_counts[name] > 0
+        }
+        if not pool:
+            return False
+        current_objective = _senior_on_call_weekend_objective(pool)
+        current_counts = Counter({name: konen_weekend_counts[name] for name in pool})
+        rolling_counts = Counter({
+            name: previous_senior_weekend_counts[name] + konen_weekend_counts[name]
+            for name in pool
+        })
+        min_current = min(current_counts.values())
+        max_current = max(current_counts.values())
+        if max_current == min_current:
+            return False
+
+        rows = roster[roster["Shift"] == KONEN_MION_SHIFT].copy()
+        rows["_date"] = rows["Date"].map(lambda value: date.fromisoformat(str(value)))
+        weekend_rows = rows[rows["_date"].map(lambda d: d.weekday() in (4, 5))]
+        weekday_rows = rows[~rows["_date"].map(lambda d: d.weekday() in (4, 5))]
+        candidates: list[tuple[int, int, int, str, int, int, str, str]] = []
+
+        for weekend_idx, weekend_row in weekend_rows.iterrows():
+            weekend_date = weekend_row["_date"]
+            for high_name in _name_list(weekend_row.Assigned):
+                if current_counts[high_name] != max_current:
+                    continue
+                if (weekend_date, KONEN_MION_SHIFT, high_name) in fixed_assignment_keys:
+                    continue
+                if _preferred_night_removal_penalty(high_name, KONEN_MION_SHIFT, weekend_date) >= 100:
+                    continue
+                for weekday_idx, weekday_row in weekday_rows.iterrows():
+                    weekday_date = weekday_row["_date"]
+                    for low_name in _name_list(weekday_row.Assigned):
+                        if low_name == high_name or current_counts[low_name] != min_current:
+                            continue
+                        if (weekday_date, KONEN_MION_SHIFT, low_name) in fixed_assignment_keys:
+                            continue
+                        if _preferred_night_removal_penalty(low_name, KONEN_MION_SHIFT, weekday_date) >= 100:
+                            continue
+                        candidates.append((
+                            current_counts[high_name] - current_counts[low_name],
+                            rolling_counts[high_name] - rolling_counts[low_name],
+                            _preferred_night_removal_penalty(high_name, KONEN_MION_SHIFT, weekend_date)
+                            + _preferred_night_removal_penalty(low_name, KONEN_MION_SHIFT, weekday_date),
+                            weekend_date.isoformat(),
+                            weekend_idx,
+                            weekday_idx,
+                            high_name,
+                            low_name,
+                        ))
+
+        for _, _, _, _, weekend_idx, weekday_idx, high_name, low_name in sorted(
+            candidates,
+            key=lambda item: (-item[0], -item[1], item[2], item[3]),
+        ):
+            weekend_date = _row_date(weekend_idx)
+            weekday_date = _row_date(weekday_idx)
+            original_weekend = _name_list(roster.at[weekend_idx, "Assigned"])
+            original_weekday = _name_list(roster.at[weekday_idx, "Assigned"])
+            current_weekend = [name for name in original_weekend if name != high_name]
+            current_weekday = [name for name in original_weekday if name != low_name]
+            roster.at[weekend_idx, "Assigned"] = _write_name_list(current_weekend)
+            roster.at[weekday_idx, "Assigned"] = _write_name_list(current_weekday)
+            _rebuild_daily_assignments_from_roster()
+            _rebuild_night_state_from_roster()
+            _rebuild_live_counters_from_roster()
+
+            low_can_take_weekend = _can_worker_take_shift(
+                low_name,
+                KONEN_MION_SHIFT,
+                weekend_date,
+                last_night_map=_last_night_before(weekend_date),
+            ) and (
+                low_name != SHIMON_NAME
+                or weekend_date.weekday() != 4
+                or _shimon_friday_available(weekend_date)
+            )
+            high_can_take_weekday = _can_worker_take_shift(
+                high_name,
+                KONEN_MION_SHIFT,
+                weekday_date,
+                last_night_map=_last_night_before(weekday_date),
+            )
+            if low_can_take_weekend and high_can_take_weekday:
+                roster.at[weekend_idx, "Assigned"] = _write_name_list(current_weekend + [low_name])
+                roster.at[weekday_idx, "Assigned"] = _write_name_list(current_weekday + [high_name])
+                _rebuild_daily_assignments_from_roster()
+                _rebuild_night_state_from_roster()
+                _rebuild_live_counters_from_roster()
+                candidate_objective = _senior_on_call_weekend_objective(pool)
+                if candidate_objective < current_objective:
+                    logger.info(
+                        "senior on-call weekend swap: %s %s <-> %s %s objective %s -> %s",
+                        weekend_date.isoformat(), high_name,
+                        weekday_date.isoformat(), low_name,
+                        current_objective, candidate_objective,
+                    )
+                    return True
+
+            roster.at[weekend_idx, "Assigned"] = _write_name_list(original_weekend)
+            roster.at[weekday_idx, "Assigned"] = _write_name_list(original_weekday)
+            _rebuild_daily_assignments_from_roster()
+            _rebuild_night_state_from_roster()
+            _rebuild_live_counters_from_roster()
+        return False
+
+    def _repair_senior_on_call_weekends(max_steps: int = 12) -> int:
+        repaired = 0
+        for _ in range(max_steps):
+            if not _try_senior_on_call_weekend_swap():
+                break
+            repaired += 1
         return repaired
 
     def _senior_yoeatzim_pool() -> set[str]:
@@ -5323,11 +6384,9 @@ def auto_assign(
                     if _resident_night_spacing_penalty(name, pref_date, effective_last_night) >= 100:
                         continue
                     score = (
-                        _resident_sandwich_balance_key(name, pref_date),
-                        _resident_sandwich_penalty_for(name, pref_date),
                         _resident_night_balance_key(name, shift_type, pref_date),
-                        _weekend_resident_night_key(name, pref_date),
                         resident_night_shift_counts[shift_type][name],
+                        _resident_assignment_jitter(name, shift_type, pref_date),
                     )
                 else:
                     score = (
@@ -5494,8 +6553,8 @@ def auto_assign(
                     if non_sandwich:
                         elig = non_sandwich
 
-                    # primary key: how many night duties this month
-                    # secondary key: original fairness score (lifetime + recency)
+                    # Protected resident priorities first; preference/history only
+                    # guide otherwise equal current-month outcomes.
                     pick = min(
                         elig,
                         key=lambda w: (
@@ -5511,6 +6570,7 @@ def auto_assign(
                             _resident_night_spacing_penalty(w, shift_date, effective_last_night),
                             fairness_score(w, shift_type, shift_date,
                                         history, effective_last_night),
+                            _resident_assignment_jitter(w, shift_type, shift_date),
                         ),
                     )
                 elif shift_type == KONEN_MION_SHIFT:
@@ -5695,12 +6755,15 @@ def auto_assign(
     if after_duty_removed:
         logger.info("After-duty cleanup removed %d assignments", after_duty_removed)
     report_progress(82, "משלים שיבוצים חסרים")
-    refilled_hard_rows = _refill_hard_rows_after_cleanup()
+    refilled_hard_rows = _refill_required_rows_after_cleanup()
     if refilled_hard_rows:
         logger.info("Final hard-row refill filled %d assignments", refilled_hard_rows)
     repaired_konen = _repair_konen_mion_balance()
     if repaired_konen:
         logger.info("Senior on-call balance repair changed %d assignments", repaired_konen)
+    repaired_konen_weekends = _repair_senior_on_call_weekends()
+    if repaired_konen_weekends:
+        logger.info("Senior on-call weekend balance changed %d assignment pairs", repaired_konen_weekends)
 
     print(f"    -> bucket done ({filled_so_far}/{total_slots} shifts filled)")
     report_progress(84, "בודק מרפאות מול אטנדינג")
@@ -5759,7 +6822,7 @@ def auto_assign(
             removed_conflicts,
         )
         _rebuild_live_counters_from_roster()
-        refilled = _refill_hard_rows_after_cleanup()
+        refilled = _refill_required_rows_after_cleanup()
         logger.info(
             "same-day conflict cleanup round %d refilled %d hard slots",
             cleanup_round + 1,
@@ -5781,7 +6844,7 @@ def auto_assign(
             removed_conflicts,
         )
         _rebuild_live_counters_from_roster()
-        refilled = _refill_hard_rows_after_cleanup()
+        refilled = _refill_required_rows_after_cleanup()
         logger.info(
             "post-coupling same-day conflict cleanup round %d refilled %d hard slots",
             cleanup_round + 1,
@@ -5790,7 +6853,7 @@ def auto_assign(
         roster = enforce_epilepsy_eeg_coupling(roster, daily_assignments=daily_assignments)
     _resolve_same_day_conflicts()
     report_progress(88, "משלים אחרי ניקוי")
-    final_refilled = _refill_hard_rows_after_cleanup()
+    final_refilled = _refill_required_rows_after_cleanup()
     if final_refilled:
         logger.info("Post-cleanup hard-row refill filled %d assignments", final_refilled)
 
@@ -5819,7 +6882,7 @@ def auto_assign(
     final_after_duty_removed = _resolve_after_duty_conflicts()
     if final_after_duty_removed:
         logger.info("Post-cleanup after-duty cleanup removed %d assignments", final_after_duty_removed)
-    final_refilled_after_duty = _refill_hard_rows_after_cleanup()
+    final_refilled_after_duty = _refill_required_rows_after_cleanup()
     if final_refilled_after_duty:
         logger.info("Post-cleanup after-duty refill filled %d assignments", final_refilled_after_duty)
 
@@ -5827,6 +6890,15 @@ def auto_assign(
     final_repaired_konen = timed_repair("senior_on_call_balance", _repair_konen_mion_balance)
     if final_repaired_konen:
         logger.info("Post-cleanup senior on-call balance repair changed %d assignments", final_repaired_konen)
+    final_repaired_konen_weekends = timed_repair(
+        "senior_on_call_weekends",
+        _repair_senior_on_call_weekends,
+    )
+    if final_repaired_konen_weekends:
+        logger.info(
+            "Post-cleanup senior on-call weekend balance changed %d assignment pairs",
+            final_repaired_konen_weekends,
+        )
     final_konen_friday_pairings = _repair_friday_pairings()
     if final_konen_friday_pairings:
         logger.info("Post-konen Friday duty/day pairing repair changed %d assignments", final_konen_friday_pairings)
@@ -5835,7 +6907,7 @@ def auto_assign(
     if final_repaired_yoeatzim:
         logger.info("Post-cleanup senior consult balance repair changed %d assignments", final_repaired_yoeatzim)
     report_progress(95, "משלים אחרי איזון")
-    final_refilled_after_yoeatzim = _refill_hard_rows_after_cleanup()
+    final_refilled_after_yoeatzim = _refill_required_rows_after_cleanup()
     if final_refilled_after_yoeatzim:
         logger.info("Post-consult hard-row refill filled %d assignments", final_refilled_after_yoeatzim)
     final_post_refill_yoeatzim = _repair_yoeatzim_balance()
@@ -5859,46 +6931,45 @@ def auto_assign(
     final_thursday_balance = _repair_resident_thursday_final(max_steps=8)
     if final_thursday_balance:
         logger.info("Final resident Thursday-only repair changed %d assignments", final_thursday_balance)
-    final_shift_type_balance = timed_repair(
-        "resident_shift_type_final",
-        lambda: _repair_resident_shift_type_final(max_steps=12),
-    )
-    if final_shift_type_balance:
-        logger.info("Final resident ת.מיון/ת.מיון 2 balance changed %d assignments", final_shift_type_balance)
-    final_thursday_after_type = _repair_resident_thursday_final(max_steps=4)
-    if final_thursday_after_type:
-        logger.info("Final protected Thursday re-check changed %d assignments", final_thursday_after_type)
-    final_weekend_after_type = timed_repair(
-        "resident_weekend_after_type",
-        lambda: _repair_resident_weekend_balance(max_steps=16, use_cache=False),
-    )
-    if final_weekend_after_type:
-        _forget_repair_noops()
-        logger.info("Final protected resident weekend re-check changed %d assignments", final_weekend_after_type)
-    final_sandwich_swaps = timed_repair(
-        "resident_sandwich_final",
-        lambda: _repair_resident_sandwich_swaps(max_steps=8, use_cache=False),
-    )
-    if final_sandwich_swaps:
-        logger.info(
-            "Final total-preserving resident sandwich repair changed %d assignment pairs",
-            final_sandwich_swaps,
+    _refresh_resident_fairness_pool()
+    if _resident_night_total_objective()[0] > 1:
+        enforced_total_repairs = timed_repair(
+            "resident_total_invariant",
+            lambda: _run_resident_stage_repair(
+                "total",
+                _repair_resident_night_balance,
+            ),
         )
-    final_shift_type_after_weekend = timed_repair(
-        "resident_shift_type_after_weekend",
-        lambda: _repair_resident_shift_type_final(max_steps=12),
-    )
-    if final_shift_type_after_weekend:
-        logger.info("Final post-weekend ת.מיון/ת.מיון 2 balance changed %d assignments", final_shift_type_after_weekend)
-    final_thursday_after_weekend_type = _repair_resident_thursday_final(max_steps=4)
-    if final_thursday_after_weekend_type:
-        logger.info("Final post-weekend protected Thursday re-check changed %d assignments", final_thursday_after_weekend_type)
+        if enforced_total_repairs:
+            logger.info("Final resident total invariant changed %d assignments", enforced_total_repairs)
+            _repair_resident_night_fairness(
+                rounds=2,
+                weekend_steps=16,
+                type_steps=3,
+                thursday_steps=4,
+            )
+    _refresh_resident_fairness_pool()
+    final_total_objective = _resident_night_total_objective()
+    if final_total_objective[0] > 1:
+        logger.error(
+            "Resident total fairness invariant unresolved: objective=%s pool=%s excluded=%s counts=%s",
+            final_total_objective,
+            sorted(_resident_night_pool()),
+            sorted(resident_fairness_pool_excluded),
+            dict(sorted(_resident_night_total_counts().items())),
+        )
     final_mandatory_personal = _apply_mandatory_personal_rules()
     final_companion_personal = _apply_companion_personal_rules()
     if final_mandatory_personal:
         logger.info("Final mandatory personal rules placed %d assignments", final_mandatory_personal)
     if final_companion_personal:
         logger.info("Final companion personal rules added %d assignments", final_companion_personal)
+    final_refilled_after_personal = _refill_required_rows_after_cleanup()
+    if final_refilled_after_personal:
+        logger.info(
+            "Post-personal-rule hard-row refill filled %d assignments",
+            final_refilled_after_personal,
+        )
     report_progress(96, "מסמן שיבוצים חסרים")
     final_missing_rows = _mark_missing_required_rows()
     if final_missing_rows:

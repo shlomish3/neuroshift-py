@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timedelta, date
 from pathlib import Path
-from typing import List, Dict, Sequence, Iterable
+from typing import List, Dict, Sequence, Iterable, Mapping, Set
 import re
 
 from openpyxl import load_workbook
@@ -19,7 +19,16 @@ from openpyxl.formatting.rule import FormulaRule
 from openpyxl.workbook import Workbook
 from openpyxl.worksheet.formula import ArrayFormula
 
-from core.elig_utils import workers_df, unavail_lookup   # auto-build of unassigned lists
+from core.constants import DUAL_OK
+from core.elig_utils import (
+    CLINIC_SHIFTS,
+    can_do,
+    fixed_clinic_lut,
+    unavail_lookup,
+    weekday_letter,
+    workers_df,
+)
+from core.eligibility2 import eligibility_reason
 from core.data import backend_tables
 from core.holiday_utils import (
     holiday_display_names_from_tables,
@@ -84,8 +93,10 @@ TORANUT_SENIORS: List[str] = [
 ]
 TORANUT_RESIDENTS: List[str] = [
     "ברג", "גלינסקיה", "דקל", "הסר", "לקן", "עסלי", "פריאנטה",
-    "שמואל", "חדיג'ה", "ארדשירוב", "סעוב",
+    "שמואל", "חדיג'ה", "ארדשירוב", "סעוב", "שיר",
 ]
+_RESIDENT_NIGHT_SHIFTS = ("ת.מיון", "ת.מיון 2")
+_TORANUT_NIGHT_SHIFTS = (*_RESIDENT_NIGHT_SHIFTS, "כונן מיון")
 
 # ──────────────────────────────────────────────────────────────
 #  helpers
@@ -148,18 +159,110 @@ def _auto_days_off() -> Dict[str, List[str]]:
 
 def _auto_nights_off() -> Dict[str, List[str]]:
     """
-    Return {date_iso: [names…]} for night-duty-only requests
-    ("לא זמין לתורנות"), based on unified availability lookup.
+    Return workers whose availability requests block every night shift they
+    are qualified to perform.  This includes both "לא זמין לתורנות" and the
+    general "לא זמין" block, while preserving the scheduler's source-specific
+    exemptions.
     """
     lookup = unavail_lookup()  # {(name, date_iso): [(block, src), ...]}
+    capability = can_do()
     by_date: Dict[str, List[str]] = {}
-    for (name, d_iso), tags in lookup.items():
-        if any(bt == "לא זמין לתורנות" for bt, _ in tags):
+    for name, d_iso in lookup:
+        capable_shifts = [
+            shift
+            for shift in _TORANUT_NIGHT_SHIFTS
+            if capability.get((name, shift), True)
+        ]
+        if capable_shifts and all(
+            (reason := eligibility_reason(name, d_iso, shift)) is not None
+            and reason.startswith("availability:")
+            for shift in capable_shifts
+        ):
             by_date.setdefault(d_iso, []).append(name)
 
     for k, v in by_date.items():
         by_date[k] = sorted(set(v))
     return by_date
+
+
+def _assignments_by_date_name(
+    roster_df: pd.DataFrame,
+) -> Dict[tuple[str, str], Set[str]]:
+    """Index the final roster as {(ISO date, name): {assigned shifts}}."""
+    assignments: Dict[tuple[str, str], Set[str]] = {}
+    for _, row in roster_df.iterrows():
+        d_iso = str(row.get("Date", ""))
+        shift = str(row.get("Shift", ""))
+        for name in _names(str(row.get("Assigned", ""))):
+            assignments.setdefault((d_iso, name), set()).add(shift)
+    return assignments
+
+
+def _resident_night_candidate_reason(
+    name: str,
+    shift_date: date,
+    shift: str,
+    assignments_by_date_name: Mapping[tuple[str, str], Set[str]],
+    *,
+    evaluating_current_assignment: bool = False,
+) -> str | None:
+    """Return the first rule that prevents a resident-night assignment."""
+    d_iso = shift_date.isoformat()
+    reason = eligibility_reason(name, d_iso, shift)
+    if reason:
+        return reason
+
+    for adjacent in (shift_date - timedelta(days=1), shift_date + timedelta(days=1)):
+        adjacent_shifts = assignments_by_date_name.get((adjacent.isoformat(), name), set())
+        if adjacent_shifts.intersection(_RESIDENT_NIGHT_SHIFTS):
+            return "adjacent-resident-night"
+
+    tomorrow = shift_date + timedelta(days=1)
+    tomorrow_iso = tomorrow.isoformat()
+    if fixed_clinic_lut().get((name, weekday_letter(tomorrow_iso)), set()):
+        return "tomorrow-fixed-clinic"
+    tomorrow_shifts = assignments_by_date_name.get((tomorrow_iso, name), set())
+    if any(existing in CLINIC_SHIFTS or existing == "מיון" for existing in tomorrow_shifts):
+        return "tomorrow-morning"
+
+    today = set(assignments_by_date_name.get((d_iso, name), set()))
+    if evaluating_current_assignment:
+        today.discard(shift)
+    if today.intersection(_RESIDENT_NIGHT_SHIFTS):
+        return "same-day-resident-night"
+    if len(today) >= 2:
+        return "resident-daily-limit"
+    if len(today) == 1:
+        existing = next(iter(today))
+        if (existing, shift) not in DUAL_OK:
+            return "illegal-same-day-pair"
+    return None
+
+
+_RESIDENT_BLOCK_REASON_HE = {
+    "capability": "לא מוסמך למשמרת",
+    "availability:universal-block": "לא זמין",
+    "availability:duty-only-block": "לא זמין לתורנות",
+    "availability:clinic-rule": "חסימת מרפאה קבועה",
+    "adjacent-resident-night": "תורנות בלילה סמוך",
+    "tomorrow-fixed-clinic": "מרפאה קבועה למחרת",
+    "tomorrow-morning": "עבודת בוקר למחרת",
+    "same-day-resident-night": "כבר משובץ לתורנות באותו יום",
+    "resident-daily-limit": "מגבלת שתי משמרות ביום",
+    "illegal-same-day-pair": "צירוף משמרות אסור באותו יום",
+}
+
+
+def _resident_blocked_summary(blocked_reasons: Mapping[str, str]) -> str:
+    """Compact Hebrew grouping of residents by their blocking rule."""
+    grouped: Dict[str, List[str]] = {}
+    for name, reason in blocked_reasons.items():
+        label = _RESIDENT_BLOCK_REASON_HE.get(reason, reason)
+        grouped.setdefault(label, []).append(name)
+    return "; ".join(
+        f"{label}: {', '.join(sorted(names))}"
+        for label, names in grouped.items()
+    )
 
 def _merge_names(existing: str, extra: Sequence[str]) -> str:
     """Merge comma-separated names with a list of extra names, deduped."""
@@ -433,13 +536,14 @@ def _prepare_toranut_sheet(ws) -> None:
     Clear only the areas owned by the Python exporter:
     - main toranut table in B:F
     - available-worker/formula area in H
-    - generated counting/formula area in I:Q
+    - generated counting/formula areas in I:Q and S:AC
     - helper night-unavailability column in R
     """
     _clear_range(ws, 1, 2, ws.max_row, 6, clear_merges=True)  # B:F
     _clear_range(ws, 1, 8, ws.max_row, 8, clear_merges=False)  # H:H
     _clear_range(ws, 1, 9, ws.max_row, 17, clear_merges=False)  # I:Q
     _clear_range(ws, 1, 18, ws.max_row, 18, clear_merges=False)  # R:R
+    _clear_range(ws, 1, 19, ws.max_row, 29, clear_merges=False)  # S:AC
     ws.sheet_view.rightToLeft = True
     ws.freeze_panes = None
 
@@ -816,6 +920,8 @@ def _build_month_summary_table(
         "תורנויות",
         "כוננויות",
         "לא שובצו",
+        "אינטובציה",
+        "אשפוז יום",
     ]
     start_row = 3
     start_col = 10  # J
@@ -826,6 +932,8 @@ def _build_month_summary_table(
     ws.column_dimensions["J"].width = 18
     ws.column_dimensions["O"].width = 16
     ws.column_dimensions["S"].width = 16
+    ws.column_dimensions["T"].width = 14
+    ws.column_dimensions["U"].width = 14
 
     metric_to_col = {
         "ייעוצים": 11,
@@ -837,6 +945,8 @@ def _build_month_summary_table(
         "תורנויות": 17,
         "כוננויות": 18,
         "לא שובצו": 19,
+        "אינטובציה": 20,
+        "אשפוז יום": 21,
     }
 
     for row_offset, name in enumerate(_summary_names(), start=1):
@@ -860,7 +970,12 @@ def _build_month_summary_table(
         name_col=10,
     )
 
-def _build_toranut_summary_table(ws, *, first_day_row: int, last_day_row: int) -> None:
+def _build_toranut_summary_table(
+    ws,
+    *,
+    first_day_row: int,
+    last_day_row: int,
+) -> None:
     blue = PatternFill("solid", fgColor="CDEBF7")
     green = PatternFill("solid", fgColor="C6EFCE")
     header_fill = PatternFill("solid", fgColor="D9EAD3")
@@ -967,9 +1082,9 @@ def _build_sheet_toranut(
         E <- ת.מיון 2
         F <- כונן מיון
     - Column G: available senior formula
-    - Column H: available resident formula
-    - Columns I:Q: preserved summary table from the template
-    - Column R: names marked "לא זמין לתורנות" for that date
+    - Column H: residents who pass the scheduler's final eligibility rules
+    - Columns I:Q and S:AC: generated fairness summary tables
+    - Column R: names whose availability blocks all qualified night duties
     """
     title = f"תורנויות כוננויות {_heb_month_name(year, mon)}"
     ws.merge_cells(start_row=1, start_column=3, end_row=1, end_column=5)
@@ -1003,14 +1118,15 @@ def _build_sheet_toranut(
     cell_h.alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
     ws.column_dimensions["H"].width = 30
 
-    # The resident list and summary formulas live in the template table at I:Q.
-    # Keep that block untouched and reuse the resident-name range for column H.
+    # The senior names live in the generated summary table at I:Q.  Residents
+    # are evaluated in Python because their rules include capability, adjacent
+    # nights, next-day clinics, and same-day shift compatibility.
     senior_list = "$I$5:$I$12"
-    resident_list = "$I$13:$I$23"
 
     # Build lookup from roster_df
     month_prefix = f"{year:04d}-{mon:02d}"
     subset = roster_df[roster_df["Date"].str.startswith(month_prefix)].copy()
+    assignments_by_date_name = _assignments_by_date_name(roster_df)
 
     assigned_by_date_shift: Dict[tuple[str, str], str] = {}
     for _, row in subset.iterrows():
@@ -1052,21 +1168,34 @@ def _build_sheet_toranut(
         ws.cell(row_ptr, 18, night_blocked)                                         # R
 
         senior_search_target = f'F{row_ptr} & " " & R{row_ptr}'
-        if row_ptr == 4:
-            resident_search_target = f'D{row_ptr} & " " & E{row_ptr} & " " & R{row_ptr}'
-        else:
-            resident_search_target = f'D{row_ptr} & " " & E{row_ptr} & " " & D{row_ptr-1} & " " & E{row_ptr-1} & " " & R{row_ptr}'
-
         # Using _xlfn. and ArrayFormula to prevent the openpyxl '@' bug
         senior_formula = f'=_xlfn.TEXTJOIN(", ", TRUE, _xlfn._xlws.FILTER({senior_list}, ISERROR(SEARCH({senior_list}, {senior_search_target})), ""))'
-        resident_formula = f'=_xlfn.TEXTJOIN(", ", TRUE, _xlfn._xlws.FILTER({resident_list}, ISERROR(SEARCH({resident_list}, {resident_search_target})), ""))'
-        
+
         g_cell = ws.cell(row_ptr, 7)
         g_cell.value = ArrayFormula(f"G{row_ptr}", senior_formula)
         g_cell.alignment = Alignment(wrap_text=True, horizontal="right", vertical="top", readingOrder=2)
 
+        missing_resident_shifts = [
+            shift
+            for shift in _RESIDENT_NIGHT_SHIFTS
+            if not list(_names(assigned_by_date_shift.get((d_iso, shift), "")))
+        ]
+        candidate_shifts = missing_resident_shifts or list(_RESIDENT_NIGHT_SHIFTS)
+        available_residents = [
+            name
+            for name in TORANUT_RESIDENTS
+            if any(
+                _resident_night_candidate_reason(
+                    name,
+                    cur,
+                    resident_shift,
+                    assignments_by_date_name,
+                ) is None
+                for resident_shift in candidate_shifts
+            )
+        ]
         h_cell = ws.cell(row_ptr, 8)
-        h_cell.value = ArrayFormula(f"H{row_ptr}", resident_formula)
+        h_cell.value = ", ".join(available_residents)
         h_cell.alignment = Alignment(wrap_text=True, horizontal="right", vertical="top", readingOrder=2)
         # ------------------------------
 
@@ -1148,7 +1277,11 @@ def _build_sheet_toranut(
         if r == 3:
             cell.font = Font(bold=True)
 
-    _build_toranut_summary_table(ws, first_day_row=4, last_day_row=last_row)
+    _build_toranut_summary_table(
+        ws,
+        first_day_row=4,
+        last_day_row=last_row,
+    )
     ws.freeze_panes = ws["C4"]
 
 def _build_toranut_explanation_sheet(
@@ -1167,6 +1300,7 @@ def _build_toranut_explanation_sheet(
     month_prefix = f"{year:04d}-{mon:02d}"
     subset = roster_df[roster_df["Date"].astype(str).str.startswith(month_prefix)].copy()
     nights_off_by_date = nights_off_by_date or {}
+    assignments_by_date_name = _assignments_by_date_name(roster_df)
 
     night_shifts = ["ת.מיון", "ת.מיון 2", "כונן מיון"]
     assigned_by_date_shift: Dict[tuple[str, str], List[str]] = {}
@@ -1250,6 +1384,12 @@ def _build_toranut_explanation_sheet(
     }
     rolling_resident_sandwiches = _sandwich_counts(rolling_resident_dates)
     previous_resident_sandwiches = _sandwich_counts(previous_resident_dates)
+    # Final-state explanations compare fairness only among residents who actually
+    # participated in this month's night roster. Fully unavailable residents must
+    # not create an artificial zero baseline.
+    resident_fairness_names = [name for name in TORANUT_RESIDENTS if resident_total[name] > 0]
+    if not resident_fairness_names:
+        resident_fairness_names = list(TORANUT_RESIDENTS)
 
     def _resident_explain_key(name: str, d: date, shift: str, assigned_here: Sequence[str]) -> tuple[int, ...]:
         is_assigned_here = name in assigned_here
@@ -1283,11 +1423,14 @@ def _build_toranut_explanation_sheet(
         rolling_weekend_stack = rolling_total * rolling_weekend if weekend_add else 0
         type_gap = abs(projected_tmion - projected_tmion2)
 
-        min_total = min((resident_total[n] for n in TORANUT_RESIDENTS), default=0)
-        min_weekend = min((resident_weekend[n] for n in TORANUT_RESIDENTS), default=0)
-        min_saturday = min((resident_saturday[n] for n in TORANUT_RESIDENTS), default=0)
-        min_thursday = min((resident_thursday[n] for n in TORANUT_RESIDENTS), default=0)
-        previous_baseline = min((len(previous_resident_dates.get(n, set())) for n in TORANUT_RESIDENTS), default=0)
+        min_total = min((resident_total[n] for n in resident_fairness_names), default=0)
+        min_weekend = min((resident_weekend[n] for n in resident_fairness_names), default=0)
+        min_saturday = min((resident_saturday[n] for n in resident_fairness_names), default=0)
+        min_thursday = min((resident_thursday[n] for n in resident_fairness_names), default=0)
+        previous_baseline = min(
+            (len(previous_resident_dates.get(n, set())) for n in resident_fairness_names),
+            default=0,
+        )
         burden = (
             max(0, previous_total - previous_baseline)
             + max(0, base_total - min_total)
@@ -1343,7 +1486,9 @@ def _build_toranut_explanation_sheet(
         rank = ranked.index(name) + 1 if name in ranked else 0
         key = _resident_explain_key(name, d, shift, assigned_here)
         reasons: List[str] = []
-        if rank == 1:
+        if rank == 0:
+            reasons.append("השיבוץ הסופי אינו עובר את בדיקת הכשירות והזמינות הנוכחית")
+        elif rank == 1:
             reasons.append("מדורג ראשון לפי וקטור ההוגנות")
         else:
             reasons.append(f"מדורג {rank} מבין הזמינים לפי קירוב סוף-ריצה")
@@ -1361,16 +1506,6 @@ def _build_toranut_explanation_sheet(
             reasons.append("כולל איזון סוף שבוע")
         return " | ".join(reasons)
 
-    def _resident_pool(d: date, include_current_assignment: bool) -> List[str]:
-        d_iso = d.isoformat()
-        prev_iso = (d - timedelta(days=1)).isoformat()
-        blocked = set(nights_off_by_date.get(d_iso, []))
-        for shift in ("ת.מיון", "ת.מיון 2"):
-            blocked.update(assigned_by_date_shift.get((prev_iso, shift), []))
-            if not include_current_assignment:
-                blocked.update(assigned_by_date_shift.get((d_iso, shift), []))
-        return [name for name in TORANUT_RESIDENTS if name not in blocked]
-
     def _senior_pool(d: date, include_current_assignment: bool) -> List[str]:
         d_iso = d.isoformat()
         blocked = set(nights_off_by_date.get(d_iso, []))
@@ -1378,11 +1513,30 @@ def _build_toranut_explanation_sheet(
             blocked.update(assigned_by_date_shift.get((d_iso, "כונן מיון"), []))
         return [name for name in TORANUT_SENIORS if name not in blocked]
 
-    def _resident_ranked_pool(d: date, shift: str) -> List[str]:
-        def key(name: str):
-            return (*_resident_explain_key(name, d, shift, assigned_by_date_shift.get((d.isoformat(), shift), [])), name)
+    def _resident_audit(
+        d: date,
+        shift: str,
+        assigned_here: Sequence[str],
+    ) -> tuple[List[str], Dict[str, str]]:
+        blocked: Dict[str, str] = {}
+        eligible: List[str] = []
+        for name in TORANUT_RESIDENTS:
+            reason = _resident_night_candidate_reason(
+                name,
+                d,
+                shift,
+                assignments_by_date_name,
+                evaluating_current_assignment=name in assigned_here,
+            )
+            if reason:
+                blocked[name] = reason
+            else:
+                eligible.append(name)
 
-        return sorted(_resident_pool(d, include_current_assignment=True), key=key)
+        def key(name: str):
+            return (*_resident_explain_key(name, d, shift, assigned_here), name)
+
+        return sorted(eligible, key=key), blocked
 
     def _senior_ranked_pool(d: date) -> List[str]:
         is_weekend = d.weekday() in (4, 5)
@@ -1393,9 +1547,9 @@ def _build_toranut_explanation_sheet(
 
     def _resident_reason(name: str, d: date, shift: str) -> str:
         other = "ת.מיון 2" if shift == "ת.מיון" else "ת.מיון"
-        min_total = min((resident_total[n] for n in TORANUT_RESIDENTS), default=0)
-        min_weekend = min((resident_weekend[n] for n in TORANUT_RESIDENTS), default=0)
-        min_sandwich = min((rolling_resident_sandwiches[n] for n in TORANUT_RESIDENTS), default=0)
+        min_total = min((resident_total[n] for n in resident_fairness_names), default=0)
+        min_weekend = min((resident_weekend[n] for n in resident_fairness_names), default=0)
+        min_sandwich = min((rolling_resident_sandwiches[n] for n in resident_fairness_names), default=0)
         parts: List[str] = []
         if resident_total[name] <= min_total + 1:
             parts.append("איזון סך תורנויות")
@@ -1408,7 +1562,9 @@ def _build_toranut_explanation_sheet(
         return " | ".join(parts[:3]) or "זמינות ואילוצי הוגנות"
 
     def _senior_reason(name: str, d: date) -> str:
-        min_total = min((senior_total[n] for n in TORANUT_SENIORS), default=0)
+        regular_seniors = [senior for senior in TORANUT_SENIORS if senior != "שמעון"]
+        total_pool = regular_seniors if name != "שמעון" else ["שמעון"]
+        min_total = min((senior_total[n] for n in total_pool), default=0)
         min_weekend = min((senior_weekend[n] for n in TORANUT_SENIORS), default=0)
         parts: List[str] = []
         if senior_total[name] <= min_total + 1:
@@ -1459,31 +1615,25 @@ def _build_toranut_explanation_sheet(
             if shift == "כונן מיון":
                 alternatives = _senior_pool(cur, include_current_assignment=False)
                 ranked = _senior_ranked_pool(cur)
+                resident_blocked: Dict[str, str] = {}
             else:
-                alternatives = _resident_pool(cur, include_current_assignment=False)
-                ranked = _resident_ranked_pool(cur, shift)
+                ranked, resident_blocked = _resident_audit(cur, shift, assigned_names)
+                alternatives = [name for name in ranked if name not in assigned_names]
 
             if not assigned_names:
+                if shift != "כונן מיון" and not alternatives:
+                    missing_explanation = "אין מתמחה כשיר וזמין לפי כללי התורנויות"
+                    missing_note = "חוסר שאינו ניתן למילוי אוטומטי"
+                    blocked_summary = _resident_blocked_summary(resident_blocked)
+                    if blocked_summary:
+                        missing_note = f"{missing_note} | {blocked_summary}"
+                else:
+                    missing_explanation = "לא שובץ למרות שקיימים מועמדים כשירים"
+                    missing_note = "בדיקת מנגנון המילוי נדרשת"
                 values = [
-                    cur.strftime("%d/%m/%Y"),
-                    day_label,
-                    shift,
-                    "חסר",
-                    ", ".join(alternatives),
-                    "לא שובץ בתוצאה הסופית",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "בדיקה ידנית נדרשת",
-                ]
-                values = [
-                    values[0], values[1], values[2], values[3],
-                    "", "", values[4], values[5], "",
-                    "", "", "", "", "", values[-1],
+                    cur.strftime("%d/%m/%Y"), day_label, shift, "חסר",
+                    "", "", ", ".join(alternatives), missing_explanation, "",
+                    "", "", "", "", "", missing_note,
                 ]
                 for col, value in enumerate(values, start=1):
                     ws.cell(row_ptr, col, value)
@@ -1606,7 +1756,7 @@ def _build_sheet_ovdim(ws):
     left_names = [
         "ברג", "ברטל", "גלינסקיה", "גנדלמן",
         "שמואל", "הסר", "כהן", "לקן", "דקל",
-        "עסלי", "פריאנטה", "קימיאגר", "קינן", "סעוב", "ארדשירוב", "הרש", "שמעון"
+        "עסלי", "פריאנטה", "קימיאגר", "קינן", "סעוב", "ארדשירוב", "שיר", "הרש", "שמעון"
     ]
     right_names = [
         "ערמון", "מיניוביץ'", "טולצ'ינסקי", "חדיג'ה",
@@ -2000,6 +2150,8 @@ def export_month_to_xlsx(
         "תורנויות": [],
         "כוננויות": [],
         "לא שובצו": [],
+        "אינטובציה": [],
+        "אשפוז יום": [],
     }
     month_friday_ref_groups: List[List[str]] = []
 
@@ -2014,6 +2166,8 @@ def export_month_to_xlsx(
         "EEG": 2 + SHIFT_ORDER.index("EEG"),
         "חופש": 2 + SHIFT_ORDER.index("חופש"),
         "רוטציה": 2 + SHIFT_ORDER.index("רוטציה"),
+        "אינטובציה": 2 + SHIFT_ORDER.index("אינטובציה"),
+        "אשפוז יום": 2 + SHIFT_ORDER.index("אשפוז יום"),
     }
     sun_thu_summary_metrics = {"ייעוצים", "חופש", "רוטציה"}
     friday_row_offsets = {

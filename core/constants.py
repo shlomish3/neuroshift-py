@@ -121,4 +121,5 @@ EMAIL_TO_NAME = {
     "miniovitcha@shamir.gov.il":   "מיניוביץ'",
     "ahmad3x@hotmail.com":         "חדיג'ה",
     "albasantclinic@gmail.com":    "חדיג'ה",
+    "hodayashir@gmail.com":        "שיר",
 }

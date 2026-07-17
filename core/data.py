@@ -22,7 +22,7 @@ import pandas as pd
 import requests
 from google.auth.exceptions import TransportError
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import WorksheetNotFound
+from gspread.exceptions import APIError, WorksheetNotFound
 
 from core import config
 from core.constants import USE_SIMPLE_FORM
@@ -30,23 +30,41 @@ from core.constants import USE_SIMPLE_FORM
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TTL_SEC = 300
-VERSION_CELL = ("Settings", "B2")
+RETRYABLE_API_CODES = {429, 500, 502, 503, 504}
 HISTORY_SHEET = getattr(config, "HISTORY_TAB", "history")
 HISTORY_SUMMARY_SHEET = getattr(config, "HISTORY_SUMMARY_TAB", "history_summary")
 
 T = TypeVar("T")
 
 
-def _retry(op: Callable[[], T], *, attempts: int = 3, base_sleep: float = 2.0) -> T:
+def _retry(
+    op: Callable[[], T],
+    *,
+    attempts: int = 7,
+    base_sleep: float = 2.0,
+    max_sleep: float = 20.0,
+) -> T:
     last_exc: Exception | None = None
     for i in range(attempts):
         try:
             return op()
+        except APIError as e:
+            if e.code not in RETRYABLE_API_CODES:
+                raise
+            last_exc = e
+            if i == attempts - 1:
+                raise
+            retry_after = e.response.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after else base_sleep * (2 ** i)
+            except (TypeError, ValueError):
+                delay = base_sleep * (2 ** i)
+            time.sleep(min(max_sleep, max(0.0, delay)))
         except (TransportError, requests.exceptions.RequestException, TimeoutError) as e:
             last_exc = e
             if i == attempts - 1:
                 raise
-            time.sleep(base_sleep * (i + 1))
+            time.sleep(min(max_sleep, base_sleep * (2 ** i)))
     assert last_exc is not None
     raise last_exc
 
@@ -84,28 +102,10 @@ def _history_sh() -> gspread.Spreadsheet:
 
 
 _last_pull = 0.0
-_last_token = ""
-
-
 def _should_refresh() -> bool:
-    global _last_token
-
     if os.getenv("NEUROSHIFT_NOCACHE") == "1":
         return True
-
-    if time.time() - _last_pull > TTL_SEC:
-        return True
-
-    try:
-        sheet, cell = VERSION_CELL
-        token = _sh().worksheet(sheet).acell(cell).value or ""
-        if token != _last_token:
-            _last_token = token
-            return True
-    except Exception:
-        pass
-
-    return False
+    return time.time() - _last_pull > TTL_SEC
 
 
 def df(sheet_title: str) -> pd.DataFrame:
