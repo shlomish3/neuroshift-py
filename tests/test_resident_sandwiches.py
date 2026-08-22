@@ -4,6 +4,10 @@ from datetime import date
 import unittest
 
 from core.assign2 import (
+    _resident_actionable_sandwich_pairs_from_dates,
+    _resident_night_spacing_penalty,
+    _resident_requested_sandwich_endpoints_from_dates,
+    _resident_sandwich_penalty,
     _resident_sandwich_pairs_from_dates,
     _resident_type_compensation_distance,
     _resident_type_excess_gap,
@@ -43,6 +47,104 @@ class ResidentSandwichPairsTests(unittest.TestCase):
         )
 
         self.assertEqual(result, [])
+
+    def test_pair_requested_at_both_endpoints_is_not_actionable(self) -> None:
+        first = date(2026, 9, 7)
+        second = date(2026, 9, 9)
+        requests = {
+            ("הסר", first): 1,
+            ("הסר", second): 1,
+        }
+
+        result = _resident_actionable_sandwich_pairs_from_dates(
+            {"הסר": {first, second}},
+            preferred_night_requests=requests,
+        )
+
+        self.assertEqual(result, [])
+
+    def test_both_requested_endpoints_are_protected_from_sandwich_repairs(self) -> None:
+        first = date(2026, 9, 7)
+        shared = date(2026, 9, 9)
+        third = date(2026, 9, 11)
+        requests = {
+            ("הסר", first): 1,
+            ("הסר", shared): 1,
+        }
+
+        endpoints = _resident_requested_sandwich_endpoints_from_dates(
+            {"הסר": {first, shared, third}},
+            requests,
+        )
+
+        self.assertEqual(endpoints, {("הסר", first), ("הסר", shared)})
+
+    def test_requesting_only_one_endpoint_does_not_exempt_pair(self) -> None:
+        first = date(2026, 9, 7)
+        second = date(2026, 9, 9)
+
+        result = _resident_actionable_sandwich_pairs_from_dates(
+            {"הסר": {first, second}},
+            preferred_night_requests={("הסר", second): 1},
+        )
+
+        self.assertEqual(result, [("הסר", first, second)])
+
+    def test_requested_pair_is_allowed_during_assignment(self) -> None:
+        first = date(2026, 9, 7)
+        second = date(2026, 9, 9)
+        requests = {
+            ("הסר", first): 1,
+            ("הסר", second): 1,
+        }
+        daily_assignments = {
+            first: {"הסר": {"ת.מיון"}},
+        }
+
+        self.assertEqual(
+            _resident_night_spacing_penalty(
+                "הסר",
+                second,
+                {"הסר": first},
+                preferred_night_requests=requests,
+            ),
+            0,
+        )
+        self.assertEqual(
+            _resident_sandwich_penalty(
+                "הסר",
+                second,
+                daily_assignments,
+                preferred_night_requests=requests,
+            ),
+            0,
+        )
+
+    def test_unrequested_pair_keeps_assignment_penalty(self) -> None:
+        first = date(2026, 9, 7)
+        second = date(2026, 9, 9)
+        daily_assignments = {
+            first: {"הסר": {"ת.מיון"}},
+        }
+
+        self.assertEqual(
+            _resident_night_spacing_penalty(
+                "הסר",
+                second,
+                {"הסר": first},
+                preferred_night_requests={("הסר", second): 1},
+            ),
+            100,
+        )
+        self.assertEqual(
+            _resident_sandwich_penalty(
+                "הסר",
+                second,
+                daily_assignments,
+                preferred_night_requests={("הסר", second): 1},
+            ),
+            100,
+        )
 
 
 class ResidentShiftTypeFairnessTests(unittest.TestCase):

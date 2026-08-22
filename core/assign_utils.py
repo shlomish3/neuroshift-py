@@ -40,6 +40,22 @@ def _clean(text: str) -> str:
     return str(text).replace("\u200f", "").replace("\u200e", "").strip()
 
 
+KONEN_MION_SHIFT = "\u05db\u05d5\u05e0\u05df \u05de\u05d9\u05d5\u05df"
+
+
+def canonical_shift_name(text: object) -> str:
+    """Return the roster's canonical label for known input-sheet aliases."""
+
+    cleaned = re.sub(r"\s+", " ", _clean(str(text)))
+    compact = cleaned.replace(" ", "")
+    if compact in {
+        "\u05db.\u05de\u05d9\u05d5\u05df",  # \u05db.\u05de\u05d9\u05d5\u05df
+        "\u05db\u05d5\u05e0\u05df\u05de\u05d9\u05d5\u05df",  # \u05db\u05d5\u05e0\u05df \u05de\u05d9\u05d5\u05df
+    }:
+        return KONEN_MION_SHIFT
+    return cleaned
+
+
 # ───────────────────────────────────────────────
 #  Fairness score
 # ───────────────────────────────────────────────
@@ -127,7 +143,7 @@ def filter_fixed_by_availability(
     out: dict[tuple[date, str], list[str]] = {}
 
     for (d, shift_raw), names in fixed.items():
-        shift = _clean(shift_raw)          # ← NEW: strip spaces & LTR/RTL marks
+        shift = canonical_shift_name(shift_raw)
         keep: list[str] = []
 
         for n in names:
@@ -156,7 +172,8 @@ def filter_fixed_by_availability(
                 keep.append(n)
 
         if keep:
-            out[(d, shift)] = keep
+            canonical_names = out.setdefault((d, shift), [])
+            canonical_names.extend(name for name in keep if name not in canonical_names)
 
     return out
 
@@ -181,7 +198,7 @@ def fixed_lookup(month: str, tables: dict) -> Dict[Tuple[date, str], List[str]]:
         raise ValueError(f"שיבוצים קבועים missing: {', '.join(sorted(missing))}")
 
     # ── normalise ─────────────────────────────────────────────
-    fx[COL_SHIFT] = fx[COL_SHIFT].astype(str).map(_clean)
+    fx[COL_SHIFT] = fx[COL_SHIFT].astype(str).map(canonical_shift_name)
     fx[COL_NAME]  = fx[COL_NAME].astype(str).str.strip()
     fx[COL_START] = pd.to_datetime(fx[COL_START], format="mixed",
                                    dayfirst=True, errors="coerce").dt.date

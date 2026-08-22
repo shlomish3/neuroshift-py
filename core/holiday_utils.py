@@ -50,6 +50,19 @@ def _is_erev_rest_type(kind: str) -> bool:
     return _is_rest_type(kind) and "ערב" in kind
 
 
+def _is_erev_name(name: str) -> bool:
+    """Return whether the holiday label itself identifies an eve.
+
+    The live חגים sheet normally stores rows such as ``ערב יום כיפור`` with
+    סוג=מידע.  Treating only the סוג column as authoritative made a simple
+    data-entry error (סוג=חופש) turn the eve into a full holiday and then move
+    the inferred eve one day earlier.  The explicit holiday name is the safer
+    discriminator for these rows.
+    """
+
+    return _clean(name).startswith("ערב ")
+
+
 def holiday_names_from_tables(tables: dict) -> Dict[date, str]:
     """
     Return full rest-day holidays from the חגים table.
@@ -64,9 +77,14 @@ def holiday_names_from_tables(tables: dict) -> Dict[date, str]:
     out: Dict[date, str] = {}
     for idx, d in dates.dropna().items():
         kind = _holiday_type(hol_df, idx)
-        if not _is_rest_type(kind) or _is_erev_rest_type(kind):
+        name = _holiday_name(hol_df, idx, name_col, "חג")
+        if (
+            not _is_rest_type(kind)
+            or _is_erev_rest_type(kind)
+            or _is_erev_name(name)
+        ):
             continue
-        out[d] = _holiday_name(hol_df, idx, name_col, "חג")
+        out[d] = name
 
     return out
 
@@ -83,9 +101,10 @@ def holiday_eve_names_from_tables(tables: dict) -> Dict[date, str]:
     out: Dict[date, str] = {}
     for idx, d in dates.dropna().items():
         kind = _holiday_type(hol_df, idx)
-        if not _is_erev_rest_type(kind):
+        name = _holiday_name(hol_df, idx, name_col, "ערב חג")
+        if not (_is_erev_rest_type(kind) or _is_erev_name(name)):
             continue
-        out[d] = _holiday_name(hol_df, idx, name_col, "ערב חג")
+        out[d] = name
     return out
 
 

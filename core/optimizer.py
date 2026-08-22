@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 import re
-from typing import Callable
+from typing import Callable, Mapping
 
 from openpyxl import load_workbook
 import pandas as pd
@@ -18,6 +18,13 @@ from core.eligibility2 import get_eligible_workers
 from core.export import export_month_to_xlsx
 from core.export.excel import SHIFT_ORDER
 from core.roster import template_for_month
+from core.scheduling_exceptions import (
+    ResidentConsecutiveNightException,
+    derive_fixed_resident_consecutive_night_exceptions,
+    deserialize_resident_consecutive_night_exceptions,
+    resident_consecutive_night_allowed,
+    serialize_resident_consecutive_night_exceptions,
+)
 
 
 MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
@@ -77,6 +84,45 @@ def _names(value: object) -> list[str]:
             continue
         out.append(name)
     return out
+
+
+def _assignment_key_set(
+    roster: pd.DataFrame,
+    attr_name: str,
+) -> set[tuple[date, str, str]]:
+    raw = roster.attrs.get(attr_name, [])
+    if isinstance(raw, Mapping):
+        raw = raw.values()
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+
+    keys: set[tuple[date, str, str]] = set()
+    for item in raw:
+        if isinstance(item, Mapping):
+            d_raw = item.get("date")
+            shift = str(item.get("shift") or "")
+            name = str(item.get("name") or "")
+        elif isinstance(item, (list, tuple)) and len(item) == 3:
+            d_raw, shift, name = item
+            shift = str(shift)
+            name = str(name)
+        else:
+            continue
+        try:
+            d = d_raw if isinstance(d_raw, date) else date.fromisoformat(str(d_raw))
+        except (TypeError, ValueError):
+            continue
+        if shift and name:
+            keys.add((d, shift, name))
+    return keys
+
+
+def _resident_consecutive_exceptions(
+    roster: pd.DataFrame,
+) -> set[ResidentConsecutiveNightException]:
+    return deserialize_resident_consecutive_night_exceptions(
+        roster.attrs.get("resident_consecutive_night_exceptions", [])
+    )
 
 
 def _month_sheet_name(wb, requested_month: str | None = None) -> str:
@@ -161,6 +207,33 @@ def _roster_from_export(path: str | Path, month: str | None = None) -> tuple[str
                 target_count,
                 ", ".join(sorted(owners)),
             ]
+
+    # Exported workbooks do not carry DataFrame attrs.  Reconstruct the exact
+    # one-time pair only when it is visibly present on both configured dates.
+    resident_assignments: dict[tuple[date, str], list[str]] = {}
+    for _, row in roster[roster["Shift"].isin(RESIDENT_NIGHTS)].iterrows():
+        resident_assignments[(
+            date.fromisoformat(str(row["Date"])),
+            str(row["Shift"]),
+        )] = _names(row["Assigned"])
+    exceptions = derive_fixed_resident_consecutive_night_exceptions(
+        resident_assignments
+    )
+    if exceptions:
+        roster.attrs["resident_consecutive_night_exceptions"] = (
+            serialize_resident_consecutive_night_exceptions(exceptions)
+        )
+        exception_fixed_keys: list[dict[str, str]] = []
+        for name, first, second in exceptions:
+            for shift_date in (first, second):
+                for shift in RESIDENT_NIGHTS:
+                    if name in resident_assignments.get((shift_date, shift), []):
+                        exception_fixed_keys.append({
+                            "date": shift_date.isoformat(),
+                            "shift": shift,
+                            "name": name,
+                        })
+        roster.attrs["fixed_assignment_keys"] = exception_fixed_keys
     return month_name, roster
 
 
@@ -188,6 +261,65 @@ def _night_state(roster: pd.DataFrame) -> tuple[dict[str, set[date]], dict[str, 
                 blocked_next_day[name].add(d + timedelta(days=1))
             last_night[name] = d
     return blocked_next_day, last_night
+
+
+def _resolve_after_duty_conflicts(roster: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Keep clinics over the prior night; otherwise keep the night over morning work."""
+
+    out = roster.copy()
+    daily = _daily_assignments(out)
+    exceptions = _resident_consecutive_exceptions(out)
+    night_pairs = {
+        (d, name)
+        for d, by_name in daily.items()
+        for name, shifts in by_name.items()
+        if shifts.intersection(RESIDENT_NIGHTS)
+    }
+    rest_only = {"אחרי תורנות", "חלופי", "חופש"}
+    removed = 0
+
+    for night_date, name in sorted(night_pairs):
+        tomorrow = night_date + timedelta(days=1)
+        tomorrow_shifts = daily.get(tomorrow, {}).get(name, set())
+        if tomorrow_shifts.intersection(CLINIC_SHIFTS):
+            for shift in sorted(daily.get(night_date, {}).get(name, set()).intersection(RESIDENT_NIGHTS)):
+                mask = (out["Date"] == night_date.isoformat()) & (out["Shift"] == shift)
+                if mask.any():
+                    idx = out.index[mask][0]
+                    if name in _names(out.at[idx, "Assigned"]):
+                        out.at[idx, "Assigned"] = _remove_name(out.at[idx, "Assigned"], name)
+                        removed += 1
+            continue
+
+        for shift in sorted(tomorrow_shifts - rest_only):
+            if (
+                shift in RESIDENT_NIGHTS
+                and resident_consecutive_night_allowed(
+                    exceptions,
+                    name,
+                    night_date,
+                    tomorrow,
+                )
+            ):
+                continue
+            mask = (out["Date"] == tomorrow.isoformat()) & (out["Shift"] == shift)
+            if mask.any():
+                idx = out.index[mask][0]
+                if name in _names(out.at[idx, "Assigned"]):
+                    out.at[idx, "Assigned"] = _remove_name(out.at[idx, "Assigned"], name)
+                    removed += 1
+
+    final_daily = _daily_assignments(out)
+    active_exceptions = {
+        (name, first, second)
+        for name, first, second in exceptions
+        if final_daily.get(first, {}).get(name, set()).intersection(RESIDENT_NIGHTS)
+        and final_daily.get(second, {}).get(name, set()).intersection(RESIDENT_NIGHTS)
+    }
+    out.attrs["resident_consecutive_night_exceptions"] = (
+        serialize_resident_consecutive_night_exceptions(active_exceptions)
+    )
+    return out, removed
 
 
 def _missing_count(row) -> int:
@@ -366,6 +498,7 @@ def _fill_hard_rows(roster: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
 
 def _resident_night_violations(roster: pd.DataFrame) -> list[str]:
+    exceptions = _resident_consecutive_exceptions(roster)
     by_name: dict[str, list[date]] = defaultdict(list)
     for _, row in roster[roster["Shift"].isin(RESIDENT_NIGHTS)].iterrows():
         d = date.fromisoformat(str(row["Date"]))
@@ -377,6 +510,13 @@ def _resident_night_violations(roster: pd.DataFrame) -> list[str]:
         ordered = sorted(dates)
         for prev, cur in zip(ordered, ordered[1:]):
             if (cur - prev).days == 1:
+                if resident_consecutive_night_allowed(
+                    exceptions,
+                    name,
+                    prev,
+                    cur,
+                ):
+                    continue
                 warnings.append(f"{name}: sequential resident nights {prev.isoformat()}->{cur.isoformat()}")
             elif (cur - prev).days == 2:
                 warnings.append(f"{name}: sandwich resident nights {prev.isoformat()}->{cur.isoformat()}")
@@ -414,6 +554,8 @@ def _resident_night_spread(roster: pd.DataFrame) -> tuple[int, int]:
 def _repair_resident_night_balance(roster: pd.DataFrame, max_steps: int = 24) -> tuple[pd.DataFrame, int]:
     out = roster.copy()
     repaired = 0
+    fixed_keys = _assignment_key_set(out, "fixed_assignment_keys")
+    exceptions = _resident_consecutive_exceptions(out)
 
     for _ in range(max_steps):
         pool = _resident_night_pool(out)
@@ -438,6 +580,8 @@ def _repair_resident_night_balance(roster: pd.DataFrame, max_steps: int = 24) ->
             shift_type = str(row["Shift"])
             original = _names(out.at[idx, "Assigned"])
             for high_name in [name for name in original if name in high_names]:
+                if (shift_date, shift_type, high_name) in fixed_keys:
+                    continue
                 current = [name for name in original if name != high_name]
                 out.at[idx, "Assigned"] = _write_names(current)
                 daily = _daily_assignments(out)
@@ -451,6 +595,7 @@ def _repair_resident_night_balance(roster: pd.DataFrame, max_steps: int = 24) ->
                         daily_assignments=daily,
                         blocked_reasons=None,
                         last_night=last_night,
+                        allowed_consecutive_resident_nights=exceptions,
                     )
                     if name in low_names and name not in current and name != high_name
                 ]
@@ -488,6 +633,8 @@ def optimize_roster(roster: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, objec
         optimized, refilled_after_coupling = _fill_hard_rows(optimized)
         hard_filled += refilled_after_coupling
     optimized, night_balance_repairs = _repair_resident_night_balance(optimized)
+    optimized, after_duty_removed = _resolve_after_duty_conflicts(optimized)
+    conflicts_removed += after_duty_removed
     optimized, hard_filled_after_nights = _fill_hard_rows(optimized)
     hard_filled += hard_filled_after_nights
     warnings = _resident_night_violations(optimized)

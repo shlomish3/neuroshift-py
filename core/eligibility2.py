@@ -4,7 +4,7 @@ High-level eligibility functions consumed by assign2.py."""
 
 from __future__ import annotations
 from datetime import date, timedelta
-from typing import Dict, List, Set
+from typing import Dict, Iterable, List, Set
 
 import logging
 import pandas as pd
@@ -15,6 +15,10 @@ from core.elig_utils import (
     can_do, workers_df, fixed_clinic_lut, unavail_lookup,
     weekday_letter, is_senior
 )
+from core.scheduling_exceptions import (
+    ResidentConsecutiveNightException,
+    resident_consecutive_night_allowed,
+)
 
 log = logging.getLogger(__name__)
 
@@ -23,6 +27,12 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 # List of “לא זמין” sources that do **not** block ת.מיון
 EXEMPT_DUTY_SOURCES = {"סבב / לפני מבחן"}
+
+
+def has_clinic_shift(shifts: Iterable[str]) -> bool:
+    """Return whether assignments contain a clinic that blocks the prior night."""
+
+    return not CLINIC_SHIFTS.isdisjoint(shifts)
 
 
 def eligibility_reason(name: str, date_iso: str, shift: str) -> str | None:
@@ -47,21 +57,6 @@ def eligibility_reason(name: str, date_iso: str, shift: str) -> str | None:
     # duty-only blocks
     if shift in DUTY_SHIFTS and any(bt in BLOCKS_DUTY for bt, _ in blocks):
         return "availability:duty-only-block"
-
-    # Weekly fixed-clinic rows should not veto real clinic-calendar assignments.
-    # The actual clinic calendar + capability matrix decide which clinic rows exist.
-    todays_clinics = fixed_clinic_lut().get((name, weekday_letter(date_iso)), set())
-
-    # “מרפאה קבועה” nuance: blocks day/duty shifts outside the clinic itself
-    non_clinic_day_or_duty = (DAY_SHIFTS - CLINIC_SHIFTS) | DUTY_SHIFTS
-    for bt, src in blocks:
-        if (
-            bt == "לא זמין"
-            and src == "מרפאה קבועה"
-            and shift in non_clinic_day_or_duty
-            and shift not in todays_clinics
-        ):
-            return "availability:clinic-rule"
 
     return None  # eligible
 
@@ -94,6 +89,7 @@ def get_eligible_workers(
     daily_assignments: Dict[date, Dict[str, Set[str]]] | None = None,
     blocked_reasons: Dict[tuple[date, str], str] | None = None,
     last_night: Dict[str, date] | None = None,
+    allowed_consecutive_resident_nights: Set[ResidentConsecutiveNightException] | None = None,
 ) -> list[str]:
     """Return the list of workers who may staff (*shift_date*, *shift_type*)."""
     daily_assignments = daily_assignments or {}
@@ -115,26 +111,34 @@ def get_eligible_workers(
         if reason:
             note(n, reason);  continue
 
-        # Clinics and ER tomorrow block tonight's resident night duty.
+        # Only clinics tomorrow block tonight's resident night duty.
         # These rows are assigned before nights, so the night pass must avoid
         # creating an אחרי תורנות conflict after the fact.
         if shift_type in ("ת.מיון", "ת.מיון 2"):
-            tomorrow_iso = (shift_date + timedelta(days=1)).isoformat()
-            tomorrow_clinics = fixed_clinic_lut().get((n, weekday_letter(tomorrow_iso)), set())
-            if tomorrow_clinics:
-                note(n, "tomorrow fixed clinic blocks night");  continue
-
             tomorrow = daily_assignments.get(shift_date + timedelta(days=1), {}).get(n, set())
-            if any(s in CLINIC_SHIFTS or s == "מיון" for s in tomorrow):
-                note(n, "tomorrow morning blocks night");  continue
+            if has_clinic_shift(tomorrow):
+                note(n, "tomorrow clinic blocks night");  continue
+
+        previous_night = last_night.get(n, date.min)
+        allowed_consecutive_night = bool(
+            shift_type in ("ת.מיון", "ת.מיון 2")
+            and resident_consecutive_night_allowed(
+                allowed_consecutive_resident_nights,
+                n,
+                previous_night,
+                shift_date,
+            )
+        )
 
         # ── mandatory post-ת.מיון rest ────────────────────────────
-        if shift_date in blocked_next_day.get(n, set()):
+        # The one-time exception permits only the second resident night; it
+        # does not permit any morning/day work on the rest date.
+        if shift_date in blocked_next_day.get(n, set()) and not allowed_consecutive_night:
             note(n, "next-day rest rule");  continue
         
         # forbid night-duty two evenings in a row
         if shift_type in ("ת.מיון", "ת.מיון 2") and \
-            (shift_date - last_night.get(n, date.min)).days < 2:
+            (shift_date - previous_night).days < 2 and not allowed_consecutive_night:
             note(n, "night-cooldown (<2 days)");  continue
 
         today_set = daily_assignments.get(shift_date, {}).get(n, set())

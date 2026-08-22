@@ -22,18 +22,23 @@ from openpyxl.worksheet.formula import ArrayFormula
 from core.constants import DUAL_OK
 from core.elig_utils import (
     CLINIC_SHIFTS,
+    DAY_SHIFTS,
     can_do,
     fixed_clinic_lut,
     unavail_lookup,
     weekday_letter,
     workers_df,
 )
-from core.eligibility2 import eligibility_reason
+from core.eligibility2 import eligibility_reason, has_clinic_shift
+from core.availability_simple_parser import preferred_night_dates_from_simple
 from core.data import backend_tables
 from core.holiday_utils import (
     holiday_display_names_from_tables,
     holiday_eve_names_from_tables,
     holiday_names_from_tables,
+)
+from core.scheduling_exceptions import (
+    deserialize_resident_consecutive_night_exceptions,
 )
 import pandas as pd
 
@@ -205,6 +210,7 @@ def _resident_night_candidate_reason(
     assignments_by_date_name: Mapping[tuple[str, str], Set[str]],
     *,
     evaluating_current_assignment: bool = False,
+    ignore_resident_night_assignments: bool = False,
 ) -> str | None:
     """Return the first rule that prevents a resident-night assignment."""
     d_iso = shift_date.isoformat()
@@ -212,21 +218,22 @@ def _resident_night_candidate_reason(
     if reason:
         return reason
 
-    for adjacent in (shift_date - timedelta(days=1), shift_date + timedelta(days=1)):
-        adjacent_shifts = assignments_by_date_name.get((adjacent.isoformat(), name), set())
-        if adjacent_shifts.intersection(_RESIDENT_NIGHT_SHIFTS):
-            return "adjacent-resident-night"
+    if not ignore_resident_night_assignments:
+        for adjacent in (shift_date - timedelta(days=1), shift_date + timedelta(days=1)):
+            adjacent_shifts = assignments_by_date_name.get((adjacent.isoformat(), name), set())
+            if adjacent_shifts.intersection(_RESIDENT_NIGHT_SHIFTS):
+                return "adjacent-resident-night"
 
     tomorrow = shift_date + timedelta(days=1)
     tomorrow_iso = tomorrow.isoformat()
-    if fixed_clinic_lut().get((name, weekday_letter(tomorrow_iso)), set()):
-        return "tomorrow-fixed-clinic"
     tomorrow_shifts = assignments_by_date_name.get((tomorrow_iso, name), set())
-    if any(existing in CLINIC_SHIFTS or existing == "מיון" for existing in tomorrow_shifts):
-        return "tomorrow-morning"
+    if has_clinic_shift(tomorrow_shifts):
+        return "tomorrow-clinic"
 
     today = set(assignments_by_date_name.get((d_iso, name), set()))
-    if evaluating_current_assignment:
+    if ignore_resident_night_assignments:
+        today.difference_update(_RESIDENT_NIGHT_SHIFTS)
+    elif evaluating_current_assignment:
         today.discard(shift)
     if today.intersection(_RESIDENT_NIGHT_SHIFTS):
         return "same-day-resident-night"
@@ -246,10 +253,43 @@ _RESIDENT_BLOCK_REASON_HE = {
     "availability:clinic-rule": "חסימת מרפאה קבועה",
     "adjacent-resident-night": "תורנות בלילה סמוך",
     "tomorrow-fixed-clinic": "מרפאה קבועה למחרת",
-    "tomorrow-morning": "עבודת בוקר למחרת",
+    "tomorrow-fixed-night": "תורנות קבועה בלילה הבא",
+    "tomorrow-clinic": "מרפאה למחרת",
     "same-day-resident-night": "כבר משובץ לתורנות באותו יום",
     "resident-daily-limit": "מגבלת שתי משמרות ביום",
     "illegal-same-day-pair": "צירוף משמרות אסור באותו יום",
+}
+
+_PREFERRED_AUDIT_BLOCK_HE = {
+    **_RESIDENT_BLOCK_REASON_HE,
+    "adjacent-fixed-night": "כבר בתחילת הזריעה הייתה תורנות קבועה בלילה סמוך",
+    "adjacent-history-night": "כבר בתחילת הזריעה חלה מגבלת רצף מתורנות קודמת",
+    "fixed-slot-full": "המשמרת המבוקשת הייתה מלאה בשיבוץ קבוע",
+    "adjacent-earlier-preference": "בקשה מועדפת סמוכה וחזקה/מוקדמת יותר נזרעה קודם",
+    "earlier-preference-filled-slot": "המשמרת התמלאה בבקשות מועדפות שנזרעו קודם",
+    "slot-full": "המשמרת כבר הייתה מלאה בתחילת הזריעה",
+    "no-row": "אין שורת משמרת מתאימה בתאריך המבוקש",
+    "not-required": "המשמרת אינה נדרשת בתאריך המבוקש",
+    "live-state": "אילוץ חי בשלב הזריעה מנע את השיבוץ",
+    "no-seed-candidate": "לא נמצא מועמד חוקי בשלב הזריעה",
+    "seeded-then-untracked-removal": "הבקשה נזרעה אך הוסרה מחוץ לשלבי האיזון המתועדים",
+    "no-causal-record": "לא נשמר רישום סיבתי להרצה זו",
+}
+
+_RESIDENT_PRIORITY_LABELS_HE = {
+    "missing": "מילוי תורנויות חסרות",
+    "total": "איזון סך התורנויות",
+    "weekend_friday": "איזון סופי שבוע וימי שישי",
+    "saturday": "איזון שבתות",
+    "sandwich_total": "צמצום מספר הסנדוויצ'ים",
+    "sandwich_distribution": "חלוקת הסנדוויצ'ים",
+    "shift_type": "איזון ת.מיון מול ת.מיון 2",
+}
+
+_RESIDENT_SOFT_PRIORITY_LABELS_HE = {
+    "request_fairness": "חלוקה הוגנת של שיעור הבקשות המועדפות שאושרו",
+    "thursday": "איזון תורנויות חמישי",
+    "history": "פיצוי לפי היסטוריה/עומס החודש הקודם בשוויון מלא של ליבת האיזון",
 }
 
 
@@ -1082,9 +1122,9 @@ def _build_sheet_toranut(
         E <- ת.מיון 2
         F <- כונן מיון
     - Column G: available senior formula
-    - Column H: residents who pass the scheduler's final eligibility rules
+    - Column H: live available-resident formula
     - Columns I:Q and S:AC: generated fairness summary tables
-    - Column R: names whose availability blocks all qualified night duties
+    - Column R: static night-duty blockers used by the live formulas
     """
     title = f"תורנויות כוננויות {_heb_month_name(year, mon)}"
     ws.merge_cells(start_row=1, start_column=3, end_row=1, end_column=5)
@@ -1118,10 +1158,13 @@ def _build_sheet_toranut(
     cell_h.alignment = Alignment(horizontal="center", vertical="center", readingOrder=2)
     ws.column_dimensions["H"].width = 30
 
-    # The senior names live in the generated summary table at I:Q.  Residents
-    # are evaluated in Python because their rules include capability, adjacent
-    # nights, next-day clinics, and same-day shift compatibility.
+    # Names live in the generated summary table at I:Q.  Python writes static
+    # hard blockers to R; the H formula handles current/adjacent resident-night
+    # assignments so the pool updates immediately after a manual Excel change.
     senior_list = "$I$5:$I$12"
+    resident_first_row = 5 + len(TORANUT_SENIORS)
+    resident_last_row = resident_first_row + len(TORANUT_RESIDENTS) - 1
+    resident_list = f"$I${resident_first_row}:$I${resident_last_row}"
 
     # Build lookup from roster_df
     month_prefix = f"{year:04d}-{mon:02d}"
@@ -1164,38 +1207,43 @@ def _build_sheet_toranut(
         ws.cell(row_ptr, 5, assigned_by_date_shift.get((d_iso, "ת.מיון 2"), "")) # E
         ws.cell(row_ptr, 6, assigned_by_date_shift.get((d_iso, "כונן מיון"), ""))  # F
 
-        night_blocked = ", ".join(nights_off_by_date.get(d_iso, [])) if nights_off_by_date else ""
-        ws.cell(row_ptr, 18, night_blocked)                                         # R
-
-        senior_search_target = f'F{row_ptr} & " " & R{row_ptr}'
-        # Using _xlfn. and ArrayFormula to prevent the openpyxl '@' bug
-        senior_formula = f'=_xlfn.TEXTJOIN(", ", TRUE, _xlfn._xlws.FILTER({senior_list}, ISERROR(SEARCH({senior_list}, {senior_search_target})), ""))'
-
-        g_cell = ws.cell(row_ptr, 7)
-        g_cell.value = ArrayFormula(f"G{row_ptr}", senior_formula)
-        g_cell.alignment = Alignment(wrap_text=True, horizontal="right", vertical="top", readingOrder=2)
-
-        missing_resident_shifts = [
-            shift
-            for shift in _RESIDENT_NIGHT_SHIFTS
-            if not list(_names(assigned_by_date_shift.get((d_iso, shift), "")))
-        ]
-        candidate_shifts = missing_resident_shifts or list(_RESIDENT_NIGHT_SHIFTS)
-        available_residents = [
+        static_blocked_residents = {
             name
             for name in TORANUT_RESIDENTS
-            if any(
+            if all(
                 _resident_night_candidate_reason(
                     name,
                     cur,
                     resident_shift,
                     assignments_by_date_name,
-                ) is None
-                for resident_shift in candidate_shifts
+                    ignore_resident_night_assignments=True,
+                ) is not None
+                for resident_shift in _RESIDENT_NIGHT_SHIFTS
             )
-        ]
+        }
+        night_blocked_names = set(nights_off_by_date.get(d_iso, [])) if nights_off_by_date else set()
+        night_blocked_names.update(static_blocked_residents)
+        night_blocked = ", ".join(sorted(night_blocked_names))
+        ws.cell(row_ptr, 18, night_blocked)                                         # R
+
+        senior_search_target = f'F{row_ptr} & " " & R{row_ptr}'
+        resident_search_cells = [f"D{row_ptr}", f"E{row_ptr}"]
+        if cur > first:
+            resident_search_cells.extend([f"D{row_ptr - 1}", f"E{row_ptr - 1}"])
+        if (cur + timedelta(days=1)).month == mon:
+            resident_search_cells.extend([f"D{row_ptr + 1}", f"E{row_ptr + 1}"])
+        resident_search_cells.append(f"R{row_ptr}")
+        resident_search_target = ' & " " & '.join(resident_search_cells)
+        # Using _xlfn. and ArrayFormula to prevent the openpyxl '@' bug
+        senior_formula = f'=_xlfn.TEXTJOIN(", ", TRUE, _xlfn._xlws.FILTER({senior_list}, ISERROR(SEARCH({senior_list}, {senior_search_target})), ""))'
+        resident_formula = f'=_xlfn.TEXTJOIN(", ", TRUE, _xlfn._xlws.FILTER({resident_list}, ISERROR(SEARCH({resident_list}, {resident_search_target})), ""))'
+
+        g_cell = ws.cell(row_ptr, 7)
+        g_cell.value = ArrayFormula(f"G{row_ptr}", senior_formula)
+        g_cell.alignment = Alignment(wrap_text=True, horizontal="right", vertical="top", readingOrder=2)
+
         h_cell = ws.cell(row_ptr, 8)
-        h_cell.value = ", ".join(available_residents)
+        h_cell.value = ArrayFormula(f"H{row_ptr}", resident_formula)
         h_cell.alignment = Alignment(wrap_text=True, horizontal="right", vertical="top", readingOrder=2)
         # ------------------------------
 
@@ -1282,7 +1330,418 @@ def _build_sheet_toranut(
         first_day_row=4,
         last_day_row=last_row,
     )
+    # Printing is intentionally limited to the date and three duty columns.
+    # Live availability pools and balancing summaries remain useful on screen
+    # but must not expand the default printed roster.
+    ws.print_area = f"A1:F{last_row}"
     ws.freeze_panes = ws["C4"]
+
+
+def _unmet_preferred_request_rows(
+    roster_df: pd.DataFrame,
+    year: int,
+    mon: int,
+    requests_df: pd.DataFrame | None,
+) -> List[Dict[str, object]]:
+    """Return unmet resident preferences with causal scheduler explanations."""
+
+    if requests_df is None or requests_df.empty:
+        return []
+    preferred = preferred_night_dates_from_simple(
+        requests_df,
+        target_month=f"{year:04d}-{mon:02d}",
+    )
+    if not preferred:
+        return []
+
+    assigned_by_date_shift: Dict[tuple[str, str], List[str]] = {}
+    for _, row in roster_df.iterrows():
+        shift = str(row.get("Shift", ""))
+        if shift not in _RESIDENT_NIGHT_SHIFTS:
+            continue
+        assigned_by_date_shift[(str(row.get("Date", "")), shift)] = list(
+            _names(str(row.get("Assigned", "")))
+        )
+    assignments_by_date_name = _assignments_by_date_name(roster_df)
+    capability = can_do()
+    causal_audit = roster_df.attrs.get("preferred_night_audit", {})
+    if not isinstance(causal_audit, Mapping):
+        causal_audit = {}
+    rows: List[Dict[str, object]] = []
+
+    for (name, requested_date), strength in sorted(
+        preferred.items(),
+        key=lambda item: (item[0][1], -item[1], item[0][0]),
+    ):
+        if name not in TORANUT_RESIDENTS:
+            continue
+        d_iso = requested_date.isoformat()
+        if any(
+            name in assigned_by_date_shift.get((d_iso, shift), [])
+            for shift in _RESIDENT_NIGHT_SHIFTS
+        ):
+            continue
+
+        allowed_shifts = tuple(
+            shift
+            for shift in _RESIDENT_NIGHT_SHIFTS
+            if capability.get((name, shift), False)
+        )
+        causal = causal_audit.get(f"{name}|{d_iso}")
+        if isinstance(causal, Mapping):
+            reason_code = str(causal.get("reason_code") or "diagnostic")
+            replacement_date = str(causal.get("replacement_date") or "")
+            replacement_label = ""
+            if replacement_date:
+                try:
+                    replacement_label = date.fromisoformat(replacement_date).strftime("%d/%m/%Y")
+                except ValueError:
+                    replacement_label = replacement_date
+            if reason_code == "higher_priority":
+                priority_stage = str(causal.get("priority_stage") or "")
+                priority_label = _RESIDENT_PRIORITY_LABELS_HE.get(priority_stage)
+                if priority_label:
+                    balance_scope = str(causal.get("balance_scope") or "")
+                    if balance_scope == "self":
+                        scope_label = "איזון העובד עצמו"
+                    elif balance_scope == "others":
+                        scope_label = "איזון הקבוצה/מתמחים אחרים"
+                    else:
+                        scope_label = ""
+                    scope_suffix = f" ({scope_label})" if scope_label else ""
+                    reason = (
+                        f"ויתור לטובת עדיפות מוגנת: {priority_label}"
+                        f"{scope_suffix}"
+                    )
+                else:
+                    reason_code = "diagnostic"
+                    reason = "דורש בדיקה: שלב האיזון שהסיר את הבקשה לא זוהה"
+            elif reason_code == "soft_priority":
+                priority_stage = str(causal.get("priority_stage") or "")
+                priority_label = _RESIDENT_SOFT_PRIORITY_LABELS_HE.get(priority_stage)
+                if priority_label and replacement_label:
+                    reason = (
+                        f"הוחלף בתאריך מועדף אחר ({replacement_label}) "
+                        f"לצורך {priority_label}"
+                    )
+                elif priority_label:
+                    reason = f"ויתור לטובת העדפה רכה: {priority_label}"
+                else:
+                    reason_code = "diagnostic"
+                    reason = "דורש בדיקה: ההעדפה הרכה שהסירה את הבקשה לא זוהתה"
+            elif reason_code == "request_competition":
+                block = str(causal.get("block") or "")
+                competing_names = str(causal.get("competing_names") or "").strip()
+                competitor_suffix = (
+                    f" ({competing_names})"
+                    if competing_names
+                    else ""
+                )
+                if (
+                    block == "earlier-preference-filled-slot"
+                    and bool(causal.get("fixed_slot_present"))
+                ):
+                    reason = (
+                        "משמרת מתמחים אחת הייתה תפוסה בשיבוץ קבוע; "
+                        "המשמרת השנייה ניתנה לבקשה מועדפת שנזרעה קודם"
+                        f"{competitor_suffix}"
+                    )
+                elif block == "earlier-preference-filled-slot":
+                    reason = (
+                        "משמרות המתמחים הזמינות התמלאו בבקשה מועדפת "
+                        f"שנזרעה קודם{competitor_suffix}"
+                    )
+                else:
+                    reason = (
+                        "בקשה מועדפת סמוכה שנזרעה קודם מנעה את השיבוץ"
+                        f"{competitor_suffix}"
+                    )
+            elif reason_code == "unavailable":
+                reason = "לא זמין בתאריך המבוקש"
+            else:
+                block = str(causal.get("block") or "no-causal-record")
+                block_label = _PREFERRED_AUDIT_BLOCK_HE.get(block, block)
+                if reason_code == "hard_rule":
+                    reason = f"כלל קשיח בעת הזריעה: {block_label}"
+                else:
+                    reason_code = "diagnostic"
+                    reason = f"דורש בדיקה: {block_label}"
+        elif not allowed_shifts:
+            reason_code = "hard_rule"
+            reason = "כלל קשיח: לא מוסמך לתורנות מתמחים"
+        else:
+            reasons = {
+                shift: _resident_night_candidate_reason(
+                    name,
+                    requested_date,
+                    shift,
+                    assignments_by_date_name,
+                )
+                for shift in allowed_shifts
+            }
+            hard_legal_shifts = [shift for shift, block in reasons.items() if block is None]
+            if hard_legal_shifts:
+                if any(
+                    not assigned_by_date_shift.get((d_iso, shift), [])
+                    for shift in hard_legal_shifts
+                ):
+                    reason_code = "diagnostic"
+                    reason = "דורש בדיקה: בקשה חוקית נותרה מול משמרת חסרה"
+                else:
+                    reason_code = "diagnostic"
+                    reason = "דורש בדיקה: לקובץ זה אין רישום סיבתי של שלב האיזון"
+            elif reasons and all(
+                block is not None and block.startswith("availability:")
+                for block in reasons.values()
+            ):
+                reason_code = "unavailable"
+                reason = "לא זמין בתאריך המבוקש"
+            else:
+                labels = []
+                for block in reasons.values():
+                    if not block:
+                        continue
+                    label = _RESIDENT_BLOCK_REASON_HE.get(block, block)
+                    if label not in labels:
+                        labels.append(label)
+                reason_code = "hard_rule"
+                reason = "כלל קשיח: " + (", ".join(labels) or "אין שיבוץ חוקי")
+
+        rows.append({
+            "name": name,
+            "date": requested_date,
+            "strength": int(strength),
+            "shifts": allowed_shifts,
+            "reason_code": reason_code,
+            "reason": reason,
+        })
+    return rows
+
+
+def _assignment_audit_key_set(
+    roster_df: pd.DataFrame,
+    attr_name: str,
+) -> Set[tuple[str, str, str]]:
+    """Normalize serialized scheduler assignment keys stored in DataFrame attrs."""
+
+    raw = roster_df.attrs.get(attr_name, [])
+    keys: Set[tuple[str, str, str]] = set()
+    if isinstance(raw, Mapping):
+        raw = raw.values()
+    if not isinstance(raw, (list, tuple, set)):
+        return keys
+    for item in raw:
+        if isinstance(item, Mapping):
+            d_iso = str(item.get("date") or "")
+            shift = str(item.get("shift") or "")
+            name = str(item.get("name") or "")
+        elif isinstance(item, (list, tuple)) and len(item) == 3:
+            raw_date, raw_shift, raw_name = item
+            d_iso = raw_date.isoformat() if isinstance(raw_date, date) else str(raw_date)
+            shift = str(raw_shift)
+            name = str(raw_name)
+        else:
+            continue
+        if d_iso and shift and name:
+            keys.add((d_iso, shift, name))
+    return keys
+
+
+def _assigned_toranut_explanation_rows(
+    roster_df: pd.DataFrame,
+    year: int,
+    mon: int,
+    requests_df: pd.DataFrame | None,
+) -> List[Dict[str, object]]:
+    """Build one concise, date-specific explanation per final duty assignment."""
+
+    month_prefix = f"{year:04d}-{mon:02d}"
+    records: List[tuple[date, str, str]] = []
+    for _, row in roster_df.iterrows():
+        d_iso = str(row.get("Date", ""))
+        shift = str(row.get("Shift", ""))
+        if not d_iso.startswith(month_prefix) or shift not in _TORANUT_NIGHT_SHIFTS:
+            continue
+        try:
+            shift_date = date.fromisoformat(d_iso)
+        except ValueError:
+            continue
+        for name in _names(str(row.get("Assigned", ""))):
+            records.append((shift_date, shift, name))
+
+    shift_order = {shift: index for index, shift in enumerate(_TORANUT_NIGHT_SHIFTS)}
+    records.sort(key=lambda item: (item[0], shift_order.get(item[1], 99), item[2]))
+    fixed_keys = _assignment_audit_key_set(roster_df, "fixed_assignment_keys")
+    mandatory_keys = _assignment_audit_key_set(
+        roster_df,
+        "mandatory_personal_assignment_keys",
+    )
+    consecutive_night_exceptions = (
+        deserialize_resident_consecutive_night_exceptions(
+            roster_df.attrs.get("resident_consecutive_night_exceptions", [])
+        )
+    )
+    assignments_by_date_name = _assignments_by_date_name(roster_df)
+
+    preferred: Mapping[tuple[str, date], int] = {}
+    if requests_df is not None and not requests_df.empty:
+        try:
+            preferred = preferred_night_dates_from_simple(
+                requests_df,
+                target_month=month_prefix,
+            )
+        except Exception:
+            preferred = {}
+
+    resident_records = [record for record in records if record[1] in _RESIDENT_NIGHT_SHIFTS]
+    senior_records = [record for record in records if record[1] == "כונן מיון"]
+    resident_total = Counter(name for _, _, name in resident_records)
+    resident_weekend_total = Counter(
+        name for d, _, name in resident_records if d.weekday() in (4, 5)
+    )
+    resident_saturday_total = Counter(
+        name for d, _, name in resident_records if d.weekday() == 5
+    )
+    resident_type_total = Counter((name, shift) for _, shift, name in resident_records)
+    senior_total = Counter(name for _, _, name in senior_records)
+    senior_weekend_total = Counter(
+        name for d, _, name in senior_records if d.weekday() in (4, 5)
+    )
+
+    resident_seen = Counter()
+    resident_weekend_seen = Counter()
+    resident_saturday_seen = Counter()
+    resident_type_seen = Counter()
+    senior_seen = Counter()
+    senior_weekend_seen = Counter()
+    rows: List[Dict[str, object]] = []
+
+    for shift_date, shift, name in records:
+        d_iso = shift_date.isoformat()
+        key = (d_iso, shift, name)
+        is_preferred = (name, shift_date) in preferred
+
+        if shift in _RESIDENT_NIGHT_SHIFTS:
+            resident_seen[name] += 1
+            resident_type_seen[(name, shift)] += 1
+            context = (
+                f"זו תורנות {resident_seen[name]} מתוך {resident_total[name]} בחודש, "
+                f"ומשמרת {shift} {resident_type_seen[(name, shift)]} "
+                f"מתוך {resident_type_total[(name, shift)]}."
+            )
+            balance_parts = ["איזון סך התורנויות"]
+            if shift_date.weekday() in (4, 5):
+                resident_weekend_seen[name] += 1
+                context = (
+                    f"{context[:-1]} זהו סוף שבוע {resident_weekend_seen[name]} "
+                    f"מתוך {resident_weekend_total[name]}."
+                )
+                balance_parts.append("איזון סופי שבוע וימי שישי")
+            if shift_date.weekday() == 5:
+                resident_saturday_seen[name] += 1
+                context = (
+                    f"{context[:-1]} וזו שבת {resident_saturday_seen[name]} "
+                    f"מתוך {resident_saturday_total[name]}."
+                )
+                balance_parts.append("איזון שבתות")
+
+            if key in fixed_keys:
+                source = "שיבוץ קבוע"
+                is_consecutive_exception = any(
+                    exception_name == name
+                    and shift_date in {first, second}
+                    for exception_name, first, second in consecutive_night_exceptions
+                )
+                if is_consecutive_exception:
+                    explanation = (
+                        "השיבוץ נקבע מראש ונשמר במסגרת החריג החד־פעמי "
+                        "ליום כיפור, המאפשר לאותו מתמחה שתי תורנויות לילה רצופות. "
+                        + context
+                    )
+                else:
+                    explanation = (
+                        "השיבוץ נקבע מראש לתאריך ולמשמרת אלה ונשמר משום שלא התנגש בכלל קשיח. "
+                        + context
+                    )
+            elif key in mandatory_keys:
+                source = "כלל אישי מחייב"
+                explanation = (
+                    "השיבוץ מממש כלל אישי מחייב לתאריך ולמשמרת אלה לאחר בדיקת כללים קשיחים. "
+                    + context
+                )
+            elif is_preferred:
+                source = "בקשה מועדפת"
+                explanation = (
+                    "הבקשה המועדפת לתאריך זה נזרעה בתחילת התהליך ונשמרה לאחר כל האיזונים המוגנים. "
+                    + context
+                )
+            else:
+                source = "איזון מוגן"
+                explanation = (
+                    "נבחר כמועמד חוקי במסגרת "
+                    + ", ".join(balance_parts)
+                    + "; השיבוץ נשמר רק לאחר שכל העדיפויות הגבוהות יותר נשארו תקינות. "
+                    + context
+                )
+        else:
+            senior_seen[name] += 1
+            if shift_date.weekday() in (4, 5):
+                senior_weekend_seen[name] += 1
+            context = f"זו כוננות {senior_seen[name]} מתוך {senior_total[name]} בחודש"
+            if shift_date.weekday() in (4, 5):
+                context += (
+                    f", וסוף שבוע {senior_weekend_seen[name]} "
+                    f"מתוך {senior_weekend_total[name]}"
+                )
+            context += "."
+
+            friday = shift_date if shift_date.weekday() == 4 else shift_date - timedelta(days=1)
+            saturday = friday + timedelta(days=1)
+            weekend_pair = (
+                shift_date.weekday() in (4, 5)
+                and "כונן מיון" in assignments_by_date_name.get((friday.isoformat(), name), set())
+                and "כונן מיון" in assignments_by_date_name.get((saturday.isoformat(), name), set())
+            )
+            same_friday_attending = (
+                shift_date.weekday() == 4
+                and "אטנדינג" in assignments_by_date_name.get((d_iso, name), set())
+            )
+
+            if key in fixed_keys:
+                source = "שיבוץ קבוע"
+                explanation = (
+                    "השיבוץ נקבע מראש לתאריך זה ונשמר משום שלא התנגש בכלל קשיח. "
+                    + context
+                )
+            elif key in mandatory_keys:
+                source = "כלל אישי מחייב"
+                explanation = (
+                    "השיבוץ מממש כלל אישי מחייב לאחר בדיקת כשירות וזמינות. "
+                    + context
+                )
+            elif is_preferred:
+                source = "בקשה מועדפת"
+                explanation = (
+                    "הבקשה המועדפת לתאריך זה נזרעה ונשמרה לאחר איזון הכוננויות. "
+                    + context
+                )
+            else:
+                source = "איזון כוננויות"
+                explanation = "נבחר כבכיר כשיר במסגרת איזון כוננויות החודש. " + context
+            if weekend_pair:
+                explanation += " השיבוץ שומר גם על אותו כונן בשישי ובשבת."
+            if same_friday_attending:
+                explanation += " באותו יום נשמרה גם התאמת כונן מיון/אטנדינג בלי לפגוע באיזון עבודת שישי."
+
+        rows.append({
+            "date": shift_date,
+            "shift": shift,
+            "name": name,
+            "source": source,
+            "explanation": explanation,
+        })
+    return rows
+
 
 def _build_toranut_explanation_sheet(
     ws,
@@ -1292,459 +1751,208 @@ def _build_toranut_explanation_sheet(
     *,
     nights_off_by_date: Dict[str, Sequence[str]] | None = None,
     history_df: pd.DataFrame | None = None,
+    requests_df: pd.DataFrame | None = None,
 ):
-    """Write a compact final-state audit of night-duty assignments."""
-    ws.sheet_view.rightToLeft = True
-    ws.freeze_panes = "A4"
+    """Write final assignment reasons, missing duties, and unmet preferences."""
 
+    del history_df  # retained in the public helper signature for compatibility
+    ws.sheet_view.rightToLeft = True
+    ws.freeze_panes = "A5"
+    nights_off_by_date = nights_off_by_date or {}
     month_prefix = f"{year:04d}-{mon:02d}"
     subset = roster_df[roster_df["Date"].astype(str).str.startswith(month_prefix)].copy()
-    nights_off_by_date = nights_off_by_date or {}
     assignments_by_date_name = _assignments_by_date_name(roster_df)
 
-    night_shifts = ["ת.מיון", "ת.מיון 2", "כונן מיון"]
     assigned_by_date_shift: Dict[tuple[str, str], List[str]] = {}
     for _, row in subset.iterrows():
         shift = str(row.get("Shift", ""))
-        if shift not in night_shifts:
+        if shift not in _TORANUT_NIGHT_SHIFTS:
             continue
-        d_iso = str(row.get("Date", ""))
-        assigned_by_date_shift[(d_iso, shift)] = list(_names(str(row.get("Assigned", ""))))
-
-    resident_total = Counter()
-    resident_weekend = Counter()
-    resident_saturday = Counter()
-    resident_thursday = Counter()
-    resident_shift_counts: Dict[str, Counter] = {name: Counter() for name in TORANUT_RESIDENTS}
-    resident_dates: Dict[str, set[date]] = {name: set() for name in TORANUT_RESIDENTS}
-    previous_resident_dates: Dict[str, set[date]] = {name: set() for name in TORANUT_RESIDENTS}
-    senior_total = Counter()
-    senior_weekend = Counter()
-
-    for (d_iso, shift), assigned_names in assigned_by_date_shift.items():
-        try:
-            d = date.fromisoformat(d_iso)
-        except ValueError:
-            continue
-        for name in assigned_names:
-            if shift in {"ת.מיון", "ת.מיון 2"} and name in TORANUT_RESIDENTS:
-                resident_total[name] += 1
-                resident_shift_counts[name][shift] += 1
-                resident_dates[name].add(d)
-                if d.weekday() in (4, 5):
-                    resident_weekend[name] += 1
-                if d.weekday() == 5:
-                    resident_saturday[name] += 1
-                if d.weekday() == 3:
-                    resident_thursday[name] += 1
-            elif shift == "כונן מיון" and name in TORANUT_SENIORS:
-                senior_total[name] += 1
-                if d.weekday() in (4, 5):
-                    senior_weekend[name] += 1
-
-    first_day = date(year, mon, 1)
-    previous_day = first_day - timedelta(days=1)
-    previous_month_first = previous_day.replace(day=1)
-    if history_df is not None:
-        hist_df = history_df.copy()
-    else:
-        try:
-            hist_df = backend_tables().get("history", pd.DataFrame())
-        except Exception:
-            hist_df = pd.DataFrame()
-    if not hist_df.empty:
-        hist_df = hist_df.rename(columns={c: str(c).strip() for c in hist_df.columns})
-        if "Name" not in hist_df.columns and "שם" in hist_df.columns:
-            hist_df = hist_df.rename(columns={"שם": "Name"})
-        if {"Date", "Name", "Shift"}.issubset(hist_df.columns):
-            for _, hist_row in hist_df.iterrows():
-                parsed = pd.to_datetime(hist_row.get("Date"), format="mixed", dayfirst=True, errors="coerce")
-                if pd.isna(parsed):
-                    continue
-                hist_date = parsed.date()
-                if not (previous_month_first <= hist_date <= previous_day):
-                    continue
-                name = str(hist_row.get("Name", "")).strip()
-                shift = str(hist_row.get("Shift", "")).strip()
-                if name in TORANUT_RESIDENTS and shift in {"ת.מיון", "ת.מיון 2"}:
-                    previous_resident_dates[name].add(hist_date)
-
-    def _sandwich_counts(date_map: Dict[str, set[date]]) -> Counter:
-        counts = Counter()
-        for name, dates_for_name in date_map.items():
-            for d in dates_for_name:
-                if d + timedelta(days=2) in dates_for_name and d + timedelta(days=1) not in dates_for_name:
-                    counts[name] += 1
-        return counts
-
-    resident_sandwiches = _sandwich_counts(resident_dates)
-    rolling_resident_dates: Dict[str, set[date]] = {
-        name: set(previous_resident_dates.get(name, set())) | set(resident_dates.get(name, set()))
-        for name in TORANUT_RESIDENTS
-    }
-    rolling_resident_sandwiches = _sandwich_counts(rolling_resident_dates)
-    previous_resident_sandwiches = _sandwich_counts(previous_resident_dates)
-    # Final-state explanations compare fairness only among residents who actually
-    # participated in this month's night roster. Fully unavailable residents must
-    # not create an artificial zero baseline.
-    resident_fairness_names = [name for name in TORANUT_RESIDENTS if resident_total[name] > 0]
-    if not resident_fairness_names:
-        resident_fairness_names = list(TORANUT_RESIDENTS)
-
-    def _resident_explain_key(name: str, d: date, shift: str, assigned_here: Sequence[str]) -> tuple[int, ...]:
-        is_assigned_here = name in assigned_here
-        weekend_add = int(d.weekday() in (4, 5))
-        saturday_add = int(d.weekday() == 5)
-        base_total = resident_total[name] - int(is_assigned_here)
-        base_weekend = resident_weekend[name] - int(is_assigned_here and weekend_add)
-        base_saturday = sum(1 for night_d in resident_dates.get(name, set()) if night_d.weekday() == 5) - int(is_assigned_here and saturday_add)
-        base_tmion = resident_shift_counts[name]["ת.מיון"] - int(is_assigned_here and shift == "ת.מיון")
-        base_tmion2 = resident_shift_counts[name]["ת.מיון 2"] - int(is_assigned_here and shift == "ת.מיון 2")
-        projected_total = base_total + 1
-        projected_weekend = base_weekend + weekend_add
-        projected_saturday = base_saturday + saturday_add
-        projected_tmion = base_tmion + int(shift == "ת.מיון")
-        projected_tmion2 = base_tmion2 + int(shift == "ת.מיון 2")
-
-        base_dates = set(rolling_resident_dates.get(name, set()))
-        if is_assigned_here:
-            base_dates.discard(d)
-        base_sandwich = _sandwich_counts({name: base_dates})[name]
-        projected_dates = set(base_dates)
-        projected_dates.add(d)
-        projected_sandwich = _sandwich_counts({name: projected_dates})[name]
-        sandwich_delta = max(0, projected_sandwich - base_sandwich)
-
-        previous_total = len(previous_resident_dates.get(name, set()))
-        previous_weekend = sum(1 for prev_d in previous_resident_dates.get(name, set()) if prev_d.weekday() in (4, 5))
-        rolling_total = previous_total + projected_total
-        rolling_weekend = previous_weekend + projected_weekend
-        weekend_stack = projected_total * projected_weekend if weekend_add else 0
-        rolling_weekend_stack = rolling_total * rolling_weekend if weekend_add else 0
-        type_gap = abs(projected_tmion - projected_tmion2)
-
-        min_total = min((resident_total[n] for n in resident_fairness_names), default=0)
-        min_weekend = min((resident_weekend[n] for n in resident_fairness_names), default=0)
-        min_saturday = min((resident_saturday[n] for n in resident_fairness_names), default=0)
-        min_thursday = min((resident_thursday[n] for n in resident_fairness_names), default=0)
-        previous_baseline = min(
-            (len(previous_resident_dates.get(n, set())) for n in resident_fairness_names),
-            default=0,
-        )
-        burden = (
-            max(0, previous_total - previous_baseline)
-            + max(0, base_total - min_total)
-            + max(0, base_weekend - min_weekend)
-        )
-        type_compensation = burden * (projected_tmion - projected_tmion2)
-        current_hardship = (
-            max(0, base_total - min_total) * 4
-            + max(0, base_weekend - min_weekend) * 5
-            + max(0, resident_saturday[name] - min_saturday) * 3
-            + max(0, resident_thursday[name] - min_thursday) * 2
-        )
-        current_type_compensation = current_hardship * (projected_tmion - projected_tmion2)
-
-        return (
-            projected_total,
-            projected_weekend if weekend_add else 0,
-            projected_saturday if saturday_add else 0,
-            weekend_stack,
-            rolling_total,
-            rolling_weekend if weekend_add else 0,
-            rolling_weekend_stack,
-            projected_sandwich,
-            sandwich_delta,
-            type_gap,
-            type_compensation,
-            current_hardship,
-            current_type_compensation,
-            projected_tmion if shift == "ת.מיון" else projected_tmion2,
+        assigned_by_date_shift[(str(row.get("Date", "")), shift)] = list(
+            _names(str(row.get("Assigned", "")))
         )
 
-    def _resident_score_text(name: str, d: date, shift: str, assigned_here: Sequence[str]) -> str:
-        key = _resident_explain_key(name, d, shift, assigned_here)
-        labels = [
-            "סהכ",
-            "סופש",
-            "שבת",
-            "עומס*סופש",
-            "סהכ+היסט",
-            "סופש+היסט",
-            "עומס*סופש+היסט",
-            "סנד",
-            "סנד+",
-            "פער סוג",
-            "פיצוי סוג",
-            "עומס נוכחי",
-            "פיצוי סוג נוכחי",
-            "עומס סוג",
-        ]
-        return " | ".join(f"{label}={value}" for label, value in zip(labels, key))
-
-    def _resident_choice_summary(name: str, d: date, shift: str, assigned_here: Sequence[str], ranked: Sequence[str]) -> str:
-        rank = ranked.index(name) + 1 if name in ranked else 0
-        key = _resident_explain_key(name, d, shift, assigned_here)
-        reasons: List[str] = []
-        if rank == 0:
-            reasons.append("השיבוץ הסופי אינו עובר את בדיקת הכשירות והזמינות הנוכחית")
-        elif rank == 1:
-            reasons.append("מדורג ראשון לפי וקטור ההוגנות")
-        else:
-            reasons.append(f"מדורג {rank} מבין הזמינים לפי קירוב סוף-ריצה")
-        if key[8] > 0:
-            reasons.append("מוסיף סנדוויץ'")
-        if key[10] > 0:
-            reasons.append("ת.מיון פחות מפצה מעומס קודם")
-        elif key[10] < 0:
-            reasons.append("ת.מיון 2 מפצה על עומס קודם")
-        if key[12] > 0:
-            reasons.append("ת.מיון פחות מפצה על עומס החודש")
-        elif key[12] < 0:
-            reasons.append("ת.מיון 2 מפצה על עומס החודש")
-        if d.weekday() in (4, 5):
-            reasons.append("כולל איזון סוף שבוע")
-        return " | ".join(reasons)
-
-    def _senior_pool(d: date, include_current_assignment: bool) -> List[str]:
-        d_iso = d.isoformat()
-        blocked = set(nights_off_by_date.get(d_iso, []))
-        if not include_current_assignment:
-            blocked.update(assigned_by_date_shift.get((d_iso, "כונן מיון"), []))
-        return [name for name in TORANUT_SENIORS if name not in blocked]
-
-    def _resident_audit(
-        d: date,
-        shift: str,
-        assigned_here: Sequence[str],
-    ) -> tuple[List[str], Dict[str, str]]:
-        blocked: Dict[str, str] = {}
-        eligible: List[str] = []
-        for name in TORANUT_RESIDENTS:
-            reason = _resident_night_candidate_reason(
-                name,
-                d,
-                shift,
-                assignments_by_date_name,
-                evaluating_current_assignment=name in assigned_here,
-            )
-            if reason:
-                blocked[name] = reason
-            else:
-                eligible.append(name)
-
-        def key(name: str):
-            return (*_resident_explain_key(name, d, shift, assigned_here), name)
-
-        return sorted(eligible, key=key), blocked
-
-    def _senior_ranked_pool(d: date) -> List[str]:
-        is_weekend = d.weekday() in (4, 5)
-        return sorted(
-            _senior_pool(d, include_current_assignment=True),
-            key=lambda name: (senior_total[name], senior_weekend[name] if is_weekend else 0, name),
-        )
-
-    def _resident_reason(name: str, d: date, shift: str) -> str:
-        other = "ת.מיון 2" if shift == "ת.מיון" else "ת.מיון"
-        min_total = min((resident_total[n] for n in resident_fairness_names), default=0)
-        min_weekend = min((resident_weekend[n] for n in resident_fairness_names), default=0)
-        min_sandwich = min((rolling_resident_sandwiches[n] for n in resident_fairness_names), default=0)
-        parts: List[str] = []
-        if resident_total[name] <= min_total + 1:
-            parts.append("איזון סך תורנויות")
-        if d.weekday() in (4, 5) and resident_weekend[name] <= min_weekend + 1:
-            parts.append("איזון סופי שבוע")
-        if resident_shift_counts[name][shift] <= resident_shift_counts[name][other]:
-            parts.append("איזון ת.מיון/ת.מיון 2")
-        if rolling_resident_sandwiches[name] <= min_sandwich + 1:
-            parts.append("מעט סנדוויצ'ים")
-        return " | ".join(parts[:3]) or "זמינות ואילוצי הוגנות"
-
-    def _senior_reason(name: str, d: date) -> str:
-        regular_seniors = [senior for senior in TORANUT_SENIORS if senior != "שמעון"]
-        total_pool = regular_seniors if name != "שמעון" else ["שמעון"]
-        min_total = min((senior_total[n] for n in total_pool), default=0)
-        min_weekend = min((senior_weekend[n] for n in TORANUT_SENIORS), default=0)
-        parts: List[str] = []
-        if senior_total[name] <= min_total + 1:
-            parts.append("איזון כונן מיון")
-        if d.weekday() in (4, 5) and senior_weekend[name] <= min_weekend + 1:
-            parts.append("איזון סוף שבוע")
-        return " | ".join(parts) or "זמינות בכירים"
-
-    ws.cell(1, 1, f"הסבר תורנויות {_heb_month_name(year, mon)}")
-    ws.cell(1, 1).font = Font(bold=True, size=14)
-    ws.cell(1, 1).alignment = Alignment(horizontal="right", vertical="center", readingOrder=2)
-
-    headers = [
-        "תאריך",
-        "יום",
-        "משמרת",
-        "שובץ",
-        "דירוג",
-        "ניקוד נבחר",
-        "חלופות קרובות",
-        "הסבר בחירה",
-        "סיכום נבחר",
-        "סנדוויצ'ים החודש",
-        "סנדוויצ'ים כולל היסטוריה",
-        "ת.מיון/ת.מיון 2",
-        "סופי שבוע",
-        "סך תורנויות",
-        "הערות",
-    ]
+    title_fill = PatternFill("solid", fgColor="BDD7EE")
     header_fill = PatternFill("solid", fgColor="D9EAF7")
+    weekend_fill = PatternFill("solid", fgColor="FFF2CC")
     thin = Side(style="thin", color="B7B7B7")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    for col, header in enumerate(headers, start=1):
-        cell = ws.cell(3, col, header)
+    ws.merge_cells("A1:F1")
+    ws["A1"] = f"הסבר תורנויות {_heb_month_name(year, mon)}"
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A1"].alignment = Alignment(horizontal="right", vertical="center", readingOrder=2)
+
+    def write_section_title(row: int, title: str) -> int:
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+        cell = ws.cell(row, 1, title)
         cell.font = Font(bold=True)
-        cell.fill = header_fill
-        cell.border = border
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True, readingOrder=2)
+        cell.fill = title_fill
+        cell.alignment = Alignment(horizontal="right", vertical="center", readingOrder=2)
+        for column in range(1, 7):
+            ws.cell(row, column).border = border
+        return row + 1
 
-    row_ptr = 4
-    cur = date(year, mon, 1)
-    while cur.month == mon:
-        d_iso = cur.isoformat()
-        day_label = _WEEKDAY_FULL[cur.weekday()]
-        for shift in night_shifts:
-            assigned_names = assigned_by_date_shift.get((d_iso, shift), [])
-            if shift == "כונן מיון":
-                alternatives = _senior_pool(cur, include_current_assignment=False)
-                ranked = _senior_ranked_pool(cur)
-                resident_blocked: Dict[str, str] = {}
-            else:
-                ranked, resident_blocked = _resident_audit(cur, shift, assigned_names)
-                alternatives = [name for name in ranked if name not in assigned_names]
-
-            if not assigned_names:
-                if shift != "כונן מיון" and not alternatives:
-                    missing_explanation = "אין מתמחה כשיר וזמין לפי כללי התורנויות"
-                    missing_note = "חוסר שאינו ניתן למילוי אוטומטי"
-                    blocked_summary = _resident_blocked_summary(resident_blocked)
-                    if blocked_summary:
-                        missing_note = f"{missing_note} | {blocked_summary}"
-                else:
-                    missing_explanation = "לא שובץ למרות שקיימים מועמדים כשירים"
-                    missing_note = "בדיקת מנגנון המילוי נדרשת"
-                values = [
-                    cur.strftime("%d/%m/%Y"), day_label, shift, "חסר",
-                    "", "", ", ".join(alternatives), missing_explanation, "",
-                    "", "", "", "", "", missing_note,
-                ]
-                for col, value in enumerate(values, start=1):
-                    ws.cell(row_ptr, col, value)
-                row_ptr += 1
-                continue
-
-            for name in assigned_names:
-                if shift == "כונן מיון":
-                    reason = _senior_reason(name, cur) if name in TORANUT_SENIORS else "שיבוץ סופי"
-                    rank = ranked.index(name) + 1 if name in ranked else ""
-                    senior_alternatives = [
-                        f"{alt}: סהכ={senior_total[alt]}, סופש={senior_weekend[alt]}"
-                        for alt in ranked
-                        if alt != name
-                    ][:5]
-                    values = [
-                        cur.strftime("%d/%m/%Y"),
-                        day_label,
-                        shift,
-                        name,
-                        ", ".join(alternatives),
-                        reason,
-                        rank,
-                        senior_total[name],
-                        senior_weekend[name],
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                    ]
-                    values = [
-                        values[0], values[1], values[2], values[3],
-                        rank,
-                        f"סהכ={senior_total[name]} | סופש={senior_weekend[name]}",
-                        "; ".join(senior_alternatives),
-                        reason,
-                        f"סהכ {senior_total[name]}, סופש {senior_weekend[name]}",
-                        "",
-                        "",
-                        "",
-                        senior_weekend[name],
-                        senior_total[name],
-                        "",
-                    ]
-                else:
-                    reason = _resident_reason(name, cur, shift) if name in TORANUT_RESIDENTS else "שיבוץ סופי"
-                    rank = ranked.index(name) + 1 if name in ranked else ""
-                    nearby_alternatives = [
-                        f"{alt}: {_resident_score_text(alt, cur, shift, assigned_names)}"
-                        for alt in ranked
-                        if alt != name
-                    ][:4]
-                    choice_summary = _resident_choice_summary(name, cur, shift, assigned_names, ranked)
-                    values = [
-                        cur.strftime("%d/%m/%Y"),
-                        day_label,
-                        shift,
-                        name,
-                        ", ".join(alternatives),
-                        reason,
-                        rank,
-                        resident_total[name],
-                        resident_weekend[name],
-                        resident_shift_counts[name]["ת.מיון"],
-                        resident_shift_counts[name]["ת.מיון 2"],
-                        resident_sandwiches[name],
-                        rolling_resident_sandwiches[name],
-                        f"חודש קודם: {previous_resident_sandwiches[name]}" if previous_resident_sandwiches[name] else "",
-                    ]
-                    values = [
-                        values[0], values[1], values[2], values[3],
-                        rank,
-                        _resident_score_text(name, cur, shift, assigned_names),
-                        "; ".join(nearby_alternatives),
-                        choice_summary,
-                        reason,
-                        resident_sandwiches[name],
-                        rolling_resident_sandwiches[name],
-                        f"{resident_shift_counts[name]['ת.מיון']}/{resident_shift_counts[name]['ת.מיון 2']}",
-                        resident_weekend[name],
-                        resident_total[name],
-                        f"חודש קודם: {previous_resident_sandwiches[name]}" if previous_resident_sandwiches[name] else "",
-                    ]
-                for col, value in enumerate(values, start=1):
-                    ws.cell(row_ptr, col, value)
-                row_ptr += 1
-        cur += timedelta(days=1)
-
-    widths = [14, 12, 14, 15, 10, 56, 70, 34, 32, 14, 18, 16, 12, 12, 24]
-    for col, width in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(col)].width = width
-
-    for r in range(3, row_ptr):
-        for c in range(1, len(headers) + 1):
-            cell = ws.cell(r, c)
+    def write_headers(row: int, headers: Sequence[str]) -> int:
+        for column, header in enumerate(headers, start=1):
+            cell = ws.cell(row, column, header)
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
             cell.border = border
             cell.alignment = Alignment(
-                horizontal="center" if c in {1, 2, 3, 5, 10, 11, 12, 13, 14} else "right",
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+                readingOrder=2,
+            )
+        return row + 1
+
+    def write_values(row: int, values: Sequence[object], *, weekend: bool = False) -> int:
+        for column, value in enumerate(values, start=1):
+            cell = ws.cell(row, column, value)
+            cell.border = border
+            cell.alignment = Alignment(
+                horizontal="center" if column <= 5 else "right",
                 vertical="top",
                 wrap_text=True,
                 readingOrder=2,
             )
-        if r >= 4:
-            try:
-                d = datetime.strptime(str(ws.cell(r, 1).value), "%d/%m/%Y").date()
-            except Exception:
-                d = None
-            if d and d.weekday() in (4, 5):
-                for c in range(1, len(headers) + 1):
-                    ws.cell(r, c).fill = PatternFill("solid", fgColor="FFF2CC")
+            if weekend:
+                cell.fill = weekend_fill
+        return row + 1
+
+    row_ptr = 3
+    row_ptr = write_section_title(row_ptr, "הסבר שיבוצים בפועל")
+    row_ptr = write_headers(
+        row_ptr,
+        ["תאריך", "יום", "משמרת", "שובץ", "מקור/שיקול", "הסבר"],
+    )
+    assignment_rows = _assigned_toranut_explanation_rows(
+        roster_df,
+        year,
+        mon,
+        requests_df,
+    )
+    if assignment_rows:
+        for audit in assignment_rows:
+            shift_date = audit["date"]
+            assert isinstance(shift_date, date)
+            row_ptr = write_values(
+                row_ptr,
+                [
+                    shift_date.strftime("%d/%m/%Y"),
+                    _WEEKDAY_FULL[shift_date.weekday()],
+                    audit["shift"],
+                    audit["name"],
+                    audit["source"],
+                    audit["explanation"],
+                ],
+                weekend=shift_date.weekday() in (4, 5),
+            )
+    else:
+        ws.merge_cells(start_row=row_ptr, start_column=1, end_row=row_ptr, end_column=6)
+        row_ptr = write_values(row_ptr, ["אין שיבוצי תורנות בחודש זה"])
+
+    row_ptr += 1
+    row_ptr = write_section_title(row_ptr, "תורנויות חסרות")
+    row_ptr = write_headers(
+        row_ptr,
+        ["תאריך", "יום", "משמרת", "סטטוס", "חלופות חוקיות", "סיבה"],
+    )
+    missing_count = 0
+    cur = date(year, mon, 1)
+    while cur.month == mon:
+        d_iso = cur.isoformat()
+        for shift in _TORANUT_NIGHT_SHIFTS:
+            if assigned_by_date_shift.get((d_iso, shift), []):
+                continue
+            if shift in _RESIDENT_NIGHT_SHIFTS:
+                blocked: Dict[str, str] = {}
+                alternatives: List[str] = []
+                for name in TORANUT_RESIDENTS:
+                    reason = _resident_night_candidate_reason(
+                        name,
+                        cur,
+                        shift,
+                        assignments_by_date_name,
+                    )
+                    if reason:
+                        blocked[name] = reason
+                    else:
+                        alternatives.append(name)
+                if alternatives:
+                    explanation = "לא שובץ למרות שקיימים מועמדים כשירים"
+                else:
+                    explanation = "אין מתמחה כשיר וזמין לפי כללי התורנויות"
+                    blocked_summary = _resident_blocked_summary(blocked)
+                    if blocked_summary:
+                        explanation = f"{explanation} | {blocked_summary}"
+            else:
+                alternatives = [
+                    name
+                    for name in TORANUT_SENIORS
+                    if name not in set(nights_off_by_date.get(d_iso, []))
+                    and eligibility_reason(name, d_iso, shift) is None
+                ]
+                explanation = (
+                    "לא שובץ למרות שקיימים מועמדים כשירים"
+                    if alternatives
+                    else "אין בכיר כשיר וזמין"
+                )
+            row_ptr = write_values(
+                row_ptr,
+                [
+                    cur.strftime("%d/%m/%Y"),
+                    _WEEKDAY_FULL[cur.weekday()],
+                    shift,
+                    "חסר",
+                    ", ".join(alternatives),
+                    explanation,
+                ],
+                weekend=cur.weekday() in (4, 5),
+            )
+            missing_count += 1
+        cur += timedelta(days=1)
+    if not missing_count:
+        ws.merge_cells(start_row=row_ptr, start_column=1, end_row=row_ptr, end_column=6)
+        row_ptr = write_values(row_ptr, ["אין תורנויות חסרות"])
+
+    row_ptr += 1
+    row_ptr = write_section_title(row_ptr, "בקשות מועדפות שלא שובצו")
+    row_ptr = write_headers(
+        row_ptr,
+        ["שם", "תאריך מבוקש", "יום", "חשיבות", "משמרות אפשריות", "סיבה"],
+    )
+    unmet_rows = _unmet_preferred_request_rows(
+        roster_df,
+        year,
+        mon,
+        requests_df,
+    )
+    if unmet_rows:
+        for audit in unmet_rows:
+            requested_date = audit["date"]
+            assert isinstance(requested_date, date)
+            row_ptr = write_values(
+                row_ptr,
+                [
+                    audit["name"],
+                    requested_date.strftime("%d/%m/%Y"),
+                    _WEEKDAY_FULL[requested_date.weekday()],
+                    "חשוב" if audit["strength"] >= 2 else "רגיל",
+                    "/".join(audit["shifts"]) or "-",
+                    audit["reason"],
+                ],
+                weekend=requested_date.weekday() in (4, 5),
+            )
+    else:
+        ws.merge_cells(start_row=row_ptr, start_column=1, end_row=row_ptr, end_column=6)
+        write_values(row_ptr, ["כל הבקשות המועדפות שובצו"])
+
+    widths = [18, 16, 14, 14, 30, 72]
+    for column, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(column)].width = width
+
 
 def _build_sheet_ovdim(ws):
     """
@@ -2341,6 +2549,7 @@ def export_month_to_xlsx(
         mon,
         nights_off_by_date=nights_off_by_date,
         history_df=tables.get("history", pd.DataFrame()),
+        requests_df=tables.get("requests", pd.DataFrame()),
     )
     _build_sheet_ovdim(ws_ovdim)
     _build_sheet_fridays(
