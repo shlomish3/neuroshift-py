@@ -8,10 +8,10 @@ Use this order when rules compete:
 
 1. Hard eligibility and safety constraints.
 2. Fixed assignments (`שיבוצים קבועים`).
-3. The protected resident-duty optimization order below.
+3. The protected resident-duty optimization order below, including previous-month total-duty compensation inside the total-fairness stage.
 4. Other balancing and pairing preferences.
 5. Preferred/requested dates as seeding guidance.
-6. History and recency as an exact tie-breaker only.
+6. Remaining history and recency measures as exact tie-breakers only.
 
 Hard constraints include capability, submitted days off, vacations, complete or night-duty unavailability, post-duty rest, resident adjacent-night restrictions, incompatible same-day work, and other genuine safety constraints.
 
@@ -61,6 +61,10 @@ A lower item may improve only while every higher item remains equal. Do not reor
 ### Total-Duty Fairness
 
 - Among active, legally participating residents, the final total-duty spread should be no greater than 1 whenever legally feasible.
+- Evaluate total-duty fairness lexicographically as: current-month spread, current-month squared load, combined previous-plus-current-month spread, then combined squared load. This keeps current-month fairness absolute while moving previous-month compensation ahead of weekend, Saturday, sandwich, duty-type, and request tie-breaks.
+- In an otherwise equal current-month split such as 6/7 duties, prefer giving 6 to a resident who carried more duties in the previous month and 7 to a resident who carried fewer, when a legal movable assignment makes that possible.
+- Previous-month workload may decide *which* resident receives the high or low side of an equally fair current-month distribution. It must never justify increasing the current-month spread or squared load, leaving a duty empty, moving a protected fixed assignment, or violating a hard rule.
+- Later balancing stages must preserve both the current-month and previous-month-compensation components of the completed total-fairness result.
 - If a spread greater than 1 is genuinely unavoidable, keep all hard rules and emit a useful diagnostic instead of silently accepting the result or violating safety.
 - A worker who cannot participate in the month must not distort the fairness pool.
 - Fairness and history comparisons use the flexible resident pool: residents with at least one movable resident duty or legal capacity to receive one. A resident whose duties are all protected and who cannot legally receive a movable duty remains assigned but does not distort the flexible comparison target.
@@ -88,10 +92,10 @@ A sandwich is an alternating-night pair for the same resident on dates `D` and `
 - Recompute that percentage from the live trial roster after every seed, swap, and balancing repair. Do not freeze it from the initial request list or use a worker-level cached explanation. Equal request-class removals should preferentially come from the resident whose other-request approval percentage is higher.
 - Across rosters with the same number and classes of fulfilled requests, prefer distributing approvals instead of repeatedly fulfilling requests for the same resident. This remains guidance outside the protected core: any genuine improvement in priorities 1–7 may still displace a request.
 - A preferred date cannot override a hard rule or any protected optimization objective.
-- Previous-month compensation and recency are consulted only when the entire protected current-month core and the preferred-request coverage/distribution result are equal.
-- History must never worsen missing-duty coverage, current-month total fairness, weekend/Friday balance, Saturday balance, sandwich objectives, or duty-type balance.
-- History must also not worsen preferred-request coverage or its approval-percentage distribution. After core equality, the request percentage tie-break therefore precedes history; deterministic jitter/name ordering is used only after both are equal.
-- Within an exact protected-core tie, historical compensation considers rolling totals, rolling weekends, rolling sandwiches, and finally whether a previously burdened resident can receive the less burdensome `ת.מיון 2` side of an otherwise equally balanced odd duty split.
+- Previous-month **total-duty** compensation is part of the protected total-fairness stage as described above; it is not deferred until after preferred requests.
+- Other history and recency measures are consulted only when the entire protected core and the preferred-request coverage/distribution result are equal. These residual measures include rolling weekends, rolling sandwiches, recent-duty spacing, and duty-type compensation.
+- Residual history must never worsen the protected core or preferred-request coverage/distribution. Deterministic jitter/name ordering is used only after both are equal.
+- When several movable assignments provide the same previous-month total compensation, examine non-requested assignments before requested assignments. A requested assignment may be displaced only when no legal equally balanced alternative is found.
 - If the history/recency tie-break displaces a seeded preferred date, record that exact stage and the alternate date received by the resident instead of emitting an untracked-removal diagnostic.
 
 ### Active and New Workers
@@ -180,6 +184,9 @@ For personal/preferred requests that were not fulfilled:
 - If a non-protected soft preference caused the loss while the protected core stayed equal, name that soft preference and, when applicable, the alternate preferred date that was retained.
 - When one resident-night slot on a date is fixed and the other was taken by an earlier preferred request, do not report that the requested date was fully occupied by fixed assignments. State that one slot was fixed and name the competing preferred requester who received the remaining slot. Use the fixed-slot explanation only when every compatible resident-night slot was actually fixed.
 - If a preferred request was seeded first and later displaced, explain the displacement. Do not imply that a later adjacent duty existed before the preferred request was considered.
+- Reconsider a seed-time request loser if the originally named competing request is later moved away. First try a bounded direct swap and then a bounded three-assignment displacement chain, preserving the completed protected priorities. This check runs after every resident balancing stage and once more after the final protected-core pass.
+- Before exporting a competition explanation, validate the named competitor against the final roster. Never name a worker who no longer occupies the requested date. If bounded reconsideration cannot restore the request, name the protected stage that prevents restoration and state briefly that no legal equal-balance alternative was found.
+- Keep an event chain for each preferred request (seeded, rejected, displaced, reconsidered, restored, or unresolved) so the final explanation is derived from that date's actual path rather than from a worker-level or seed-only reason.
 
 Do not duplicate monthly summary metrics already displayed in `תורנויות`.
 
@@ -202,4 +209,5 @@ Do not duplicate monthly summary metrics already displayed in `תורנויות`
 
 - Do not run a full monthly roster generation or live Google-backed end-to-end run unless the user explicitly asks for that specific run.
 - Normal implementation verification should use focused unit tests, compilation/static checks, and small targeted scripts.
+- Preferred-request reconsideration must remain bounded. Run its additional direct-swap/cycle search only when a protected stage actually worsened request coverage or invalidated the original competition explanation; do not add an unbounded global optimization pass.
 - The scheduler is already operational. Make focused improvements to the current algorithm rather than rebuilding it from scratch.

@@ -493,6 +493,82 @@ class ResidentNightExportTests(unittest.TestCase):
         self.assertNotIn("מלאה בשיבוץ קבוע", rows[0]["reason"])
         self.assertNotIn("דורש בדיקה", rows[0]["reason"])
 
+    def test_reconsidered_request_names_the_protected_stage_and_search_result(self) -> None:
+        roster = pd.DataFrame(
+            [
+                {"Date": "2026-09-25", "Shift": "ת.מיון", "Assigned": "ארדשירוב"},
+                {"Date": "2026-09-25", "Shift": "ת.מיון 2", "Assigned": "גלינסקיה"},
+            ]
+        )
+        roster.attrs["preferred_night_audit"] = {
+            "סעוב|2026-09-25": {
+                "reason_code": "higher_priority",
+                "priority_stage": "weekend_friday",
+                "balance_scope": "others",
+                "alternative_search": "bounded-direct-swap-cycle",
+            },
+        }
+        preferred = {("סעוב", date(2026, 9, 25)): 1}
+        capability = {
+            ("סעוב", "ת.מיון"): True,
+            ("סעוב", "ת.מיון 2"): True,
+        }
+
+        with (
+            patch("core.export.excel.preferred_night_dates_from_simple", return_value=preferred),
+            patch("core.export.excel.can_do", return_value=capability),
+            patch("core.export.excel.eligibility_reason", return_value=None),
+            patch("core.export.excel.fixed_clinic_lut", return_value={}),
+        ):
+            rows = _unmet_preferred_request_rows(
+                roster,
+                2026,
+                9,
+                pd.DataFrame([{"dummy": 1}]),
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("איזון סופי שבוע וימי שישי", rows[0]["reason"])
+        self.assertIn("איזון הקבוצה/מתמחים אחרים", rows[0]["reason"])
+        self.assertIn("לא נמצאה חלופה חוקית שוות־איזון", rows[0]["reason"])
+
+    def test_final_fixed_capacity_reason_is_not_described_as_seed_time(self) -> None:
+        roster = pd.DataFrame(
+            [
+                {"Date": "2026-09-17", "Shift": "ת.מיון", "Assigned": "עסלי"},
+                {"Date": "2026-09-17", "Shift": "ת.מיון 2", "Assigned": "לקן"},
+            ]
+        )
+        roster.attrs["preferred_night_audit"] = {
+            "הסר|2026-09-17": {
+                "reason_code": "hard_rule",
+                "block": "fixed-slot-full",
+                "final_state": True,
+            },
+        }
+        preferred = {("הסר", date(2026, 9, 17)): 1}
+        capability = {
+            ("הסר", "ת.מיון"): True,
+            ("הסר", "ת.מיון 2"): True,
+        }
+
+        with (
+            patch("core.export.excel.preferred_night_dates_from_simple", return_value=preferred),
+            patch("core.export.excel.can_do", return_value=capability),
+            patch("core.export.excel.eligibility_reason", return_value=None),
+            patch("core.export.excel.fixed_clinic_lut", return_value={}),
+        ):
+            rows = _unmet_preferred_request_rows(
+                roster,
+                2026,
+                9,
+                pd.DataFrame([{"dummy": 1}]),
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("המשמרת המבוקשת הייתה מלאה בשיבוץ קבוע", rows[0]["reason"])
+        self.assertNotIn("בעת הזריעה", rows[0]["reason"])
+
     def test_assignment_explanations_are_keyed_to_the_exact_date(self) -> None:
         roster = pd.DataFrame(
             [

@@ -23,6 +23,7 @@ from core.assign2 import (
     _resident_core_preserved_for_request_recovery,
     _resident_saturday_swap_gain,
     _resident_stage_improves,
+    _resident_total_fairness_objective,
     _weekend_konen_target_names_for_row,
 )
 from core.availability_simple_parser import submitted_names_from_simple
@@ -31,7 +32,7 @@ from core.availability_simple_parser import submitted_names_from_simple
 def metrics(**overrides: object) -> ResidentNightMetrics:
     values: dict[str, object] = {
         "missing": 0,
-        "total": (1, 20),
+        "total": (1, 20, 2, 30),
         "weekend_friday": (1, 8, 1, 4),
         "saturday": (1, 4),
         "sandwich_total": 2,
@@ -216,6 +217,37 @@ class ResidentPriorityTests(unittest.TestCase):
         self.assertTrue(_resident_history_tiebreak_improves(before, compensated))
         self.assertFalse(_resident_history_tiebreak_improves(before, worse_core))
 
+    def test_previous_month_load_decides_who_gets_six_in_an_equal_six_seven_split(self) -> None:
+        pool = {"WorkedMore", "WorkedLess"}
+        burden_repeated = _resident_total_fairness_objective(
+            {"WorkedMore": 7, "WorkedLess": 6},
+            {"WorkedMore": 14, "WorkedLess": 11},
+            pool,
+        )
+        burden_compensated = _resident_total_fairness_objective(
+            {"WorkedMore": 6, "WorkedLess": 7},
+            {"WorkedMore": 13, "WorkedLess": 12},
+            pool,
+        )
+
+        self.assertEqual(burden_repeated[:2], burden_compensated[:2])
+        self.assertLess(burden_compensated, burden_repeated)
+
+    def test_history_never_justifies_worse_current_month_fairness(self) -> None:
+        pool = {"A", "B", "C"}
+        fair_current_month = _resident_total_fairness_objective(
+            {"A": 6, "B": 6, "C": 7},
+            {"A": 20, "B": 20, "C": 20},
+            pool,
+        )
+        historically_neater_but_currently_worse = _resident_total_fairness_objective(
+            {"A": 5, "B": 6, "C": 7},
+            {"A": 18, "B": 19, "C": 20},
+            pool,
+        )
+
+        self.assertLess(fair_current_month, historically_neater_but_currently_worse)
+
     def test_stage_local_request_recovery_ignores_only_later_priorities(self) -> None:
         before = metrics()
         lower_stage_changes = metrics(
@@ -276,7 +308,7 @@ class ResidentPriorityTests(unittest.TestCase):
     def test_total_improvement_may_worsen_lower_metrics(self) -> None:
         before = metrics()
         after = metrics(
-            total=(0, 18),
+            total=(0, 18, 2, 30),
             weekend_friday=(2, 10, 2, 6),
             sandwich_total=4,
         )
@@ -307,7 +339,7 @@ class ResidentPriorityTests(unittest.TestCase):
     def test_causal_stage_names_the_first_protected_improvement(self) -> None:
         before = metrics()
         total_wins = metrics(
-            total=(0, 18),
+            total=(0, 18, 2, 30),
             saturday=(0, 2),
         )
         saturday_wins = metrics(saturday=(0, 2))

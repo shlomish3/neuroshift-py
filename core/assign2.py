@@ -138,7 +138,7 @@ class ResidentNightMetrics(NamedTuple):
     """Resident-duty objectives in their protected project priority order."""
 
     missing: int
-    total: tuple[int, int]
+    total: tuple[int, int, int, int]
     weekend_friday: tuple[int, int, int, int]
     saturday: tuple[int, int]
     sandwich_total: int
@@ -357,6 +357,31 @@ def _adjacent_fixed_night_resolution(
 
 def _resident_core_key(metrics: ResidentNightMetrics) -> tuple[object, ...]:
     return tuple(getattr(metrics, field) for field in RESIDENT_PRIORITY_STAGES)
+
+
+def _resident_total_fairness_objective(
+    current_counts: Mapping[str, int],
+    rolling_counts: Mapping[str, int],
+    pool: Set[str],
+) -> tuple[int, int, int, int]:
+    """Balance this month first, then compensate previous-month workload.
+
+    The rolling components can only decide between outcomes with identical
+    current-month spread and square load.  They therefore choose *which*
+    resident receives the lower count in an otherwise equal 6/7-style split,
+    but can never turn that split into a worse current-month distribution.
+    """
+
+    if not pool:
+        return (0, 0, 0, 0)
+    current_values = [int(current_counts.get(name, 0)) for name in pool]
+    rolling_values = [int(rolling_counts.get(name, 0)) for name in pool]
+    return (
+        max(current_values) - min(current_values),
+        sum(value * value for value in current_values),
+        max(rolling_values) - min(rolling_values),
+        sum(value * value for value in rolling_values),
+    )
 
 
 def _resident_stage_improves(
@@ -1724,6 +1749,10 @@ def auto_assign(
     preferred_night_seed_blocks: dict[tuple[str, date], dict[str, object]] = {}
     preferred_night_loss_stage: dict[tuple[str, date], str] = {}
     preferred_night_loss_detail: dict[tuple[str, date], dict[str, str]] = {}
+    preferred_night_events: dict[
+        tuple[str, date],
+        list[dict[str, object]],
+    ] = defaultdict(list)
     preferred_night_requesters_by_date: dict[date, set[str]] = defaultdict(set)
     preferred_night_request_dates_by_name: dict[str, set[date]] = defaultdict(set)
     for pref_name, pref_date in preferred_night_requests:
@@ -2181,6 +2210,15 @@ def auto_assign(
             )
         )
 
+    def _record_preferred_night_event(
+        request_key: tuple[str, date],
+        event: str,
+        **detail: object,
+    ) -> None:
+        payload: dict[str, object] = {"event": event}
+        payload.update({key: value for key, value in detail.items() if value not in (None, "")})
+        preferred_night_events[request_key].append(payload)
+
     def _preferred_other_request_approval_percentage(
         name: str,
         excluded_date: date,
@@ -2555,6 +2593,21 @@ def auto_assign(
         projected[name] += delta
         return _count_spread_and_square(projected, pool)
 
+    def _projected_resident_total_objective(
+        pool: set[str],
+        name: str,
+        delta: int,
+    ) -> tuple[int, int, int, int]:
+        projected_current = _current_resident_total_counts(pool)
+        projected_rolling = _rolling_resident_total_counts(pool)
+        projected_current[name] += delta
+        projected_rolling[name] += delta
+        return _resident_total_fairness_objective(
+            projected_current,
+            projected_rolling,
+            pool,
+        )
+
     def _resident_assignment_jitter(name: str, shift_type: str, shift_date: date) -> int:
         jitter_key = f"{month}|{shift_date.isoformat()}|{shift_type}|{name}".encode("utf-8")
         return int.from_bytes(hashlib.blake2s(jitter_key, digest_size=2).digest(), "big")
@@ -2588,7 +2641,7 @@ def auto_assign(
         projected_shift_count = resident_night_shift_counts[shift_type][name] + 1
         sandwich_key = _resident_sandwich_balance_key(name, shift_date)
         pool = _resident_night_pool() | {name}
-        total_objective = _projected_count_objective(month_counts, pool, name, 1)
+        total_objective = _projected_resident_total_objective(pool, name, 1)
         weekend_objective = _projected_count_objective(
             weekend_night_counts,
             pool,
@@ -3893,7 +3946,7 @@ def auto_assign(
         preferred_names: set[str] | None = None,
         reason: str = "resident night repair",
         allow_sandwich: bool = False,
-        protect_total_objective: tuple[int, int] | None = None,
+        protect_total_objective: tuple[int, int, int, int] | None = None,
         protect_weekend_objective: tuple[int, int, int, int] | None = None,
         protect_saturday_objective: tuple[int, int] | None = None,
         protect_weekend_history: int | None = None,
@@ -4355,9 +4408,13 @@ def auto_assign(
         pool = _resident_night_pool()
         return _current_resident_total_counts(pool)
 
-    def _resident_night_total_objective() -> tuple[int, int]:
+    def _resident_night_total_objective() -> tuple[int, int, int, int]:
         pool = _resident_night_pool()
-        return _count_spread_and_square(_current_resident_total_counts(pool), pool)
+        return _resident_total_fairness_objective(
+            _current_resident_total_counts(pool),
+            _rolling_resident_total_counts(pool),
+            pool,
+        )
 
     def _resident_weekend_objective() -> tuple[int, int, int, int]:
         pool = _resident_night_pool()
@@ -4534,12 +4591,10 @@ def auto_assign(
         _rebuild_daily_assignments_from_roster()
         _rebuild_live_counters_from_roster()
         pool = _resident_night_pool()
-        current_total_counts = _current_resident_total_counts(pool)
-        total_spread, total_square = _count_spread_and_square(current_total_counts, pool)
         actionable_sandwiches = _resident_actionable_sandwich_counts()
         return ResidentNightMetrics(
             missing=_resident_missing_slot_count(),
-            total=(total_spread, total_square),
+            total=_resident_night_total_objective(),
             weekend_friday=_resident_weekend_objective(),
             saturday=_resident_saturday_objective(),
             sandwich_total=sum(actionable_sandwiches[name] for name in pool),
@@ -4563,6 +4618,63 @@ def auto_assign(
                 ):
                     fulfilled.add(request_key)
         return fulfilled
+
+    def _current_preferred_competitors(
+        request_key: tuple[str, date],
+    ) -> set[str]:
+        """Return final/live preferred requesters actually occupying this date."""
+
+        requester, request_date = request_key
+        competitors: set[str] = set()
+        for idx in resident_night_row_indexes:
+            if _row_date(idx) != request_date:
+                continue
+            shift_type = str(roster.at[idx, "Shift"])
+            for assigned_name in _assigned_names(idx):
+                if assigned_name == requester:
+                    continue
+                if (
+                    (assigned_name, request_date) in preferred_night_requests
+                    and shift_type in _preferred_night_shifts_for(assigned_name)
+                ):
+                    competitors.add(assigned_name)
+        return competitors
+
+    def _stale_preferred_request_competitions() -> set[tuple[str, date]]:
+        """Find seed losers whose preferred winner no longer holds the date."""
+
+        stale: set[tuple[str, date]] = set()
+        for request_key, cause in preferred_night_seed_blocks.items():
+            if cause.get("reason_code") != "request_competition":
+                continue
+            if _preferred_night_request_is_fulfilled(*request_key):
+                continue
+            if not _current_preferred_competitors(request_key):
+                stale.add(request_key)
+        return stale
+
+    def _preferred_request_all_compatible_slots_fixed(
+        request_key: tuple[str, date],
+    ) -> bool:
+        requester, request_date = request_key
+        compatible_rows = [
+            idx
+            for idx in resident_night_row_indexes
+            if _row_date(idx) == request_date
+            and str(roster.at[idx, "Shift"]) in _preferred_night_shifts_for(requester)
+            and _to_int(roster.at[idx, "Needed"], 0) > 0
+        ]
+        if not compatible_rows:
+            return False
+        return all(
+            len(_assigned_names(idx)) >= _to_int(roster.at[idx, "Needed"], 0)
+            and all(
+                (request_date, str(roster.at[idx, "Shift"]), assigned_name)
+                in fixed_assignment_keys
+                for assigned_name in _assigned_names(idx)
+            )
+            for idx in compatible_rows
+        )
 
     def _resident_personal_balance_snapshot() -> dict[str, tuple[int, int, int, int, int, int]]:
         actionable_sandwiches = _resident_actionable_sandwich_counts()
@@ -4607,6 +4719,12 @@ def auto_assign(
         after_personal_balance = _resident_personal_balance_snapshot()
 
         for request_key in after_fulfilled:
+            if request_key in preferred_night_loss_stage:
+                _record_preferred_night_event(
+                    request_key,
+                    "restored",
+                    stage=expected_stage,
+                )
             preferred_night_loss_stage.pop(request_key, None)
             preferred_night_loss_detail.pop(request_key, None)
 
@@ -4657,6 +4775,17 @@ def auto_assign(
                 preferred_night_loss_detail.setdefault(request_key, {})[
                     "replacement_date"
                 ] = replacement_date.isoformat()
+            _record_preferred_night_event(
+                request_key,
+                "displaced",
+                stage=preferred_night_loss_stage[request_key],
+                replacement_date=preferred_night_loss_detail.get(request_key, {}).get(
+                    "replacement_date"
+                ),
+                balance_scope=preferred_night_loss_detail.get(request_key, {}).get(
+                    "balance_scope"
+                ),
+            )
             logger.info(
                 "preferred night displaced: %s %s stage=%s replacement=%s metrics %s -> %s",
                 request_key[1].isoformat(),
@@ -6038,8 +6167,10 @@ def auto_assign(
     def _try_preferred_resident_night_swap(
         *,
         protect_through_stage: str | None = None,
+        max_evaluations: int = 180,
     ) -> bool:
         current_objective = _resident_night_objective()
+        evaluations = 0
         requests = sorted(
             preferred_night_requests.items(),
             key=lambda item: (
@@ -6100,6 +6231,13 @@ def auto_assign(
                             continue
                         if not worker_shift_lut.get((displaced, donor_shift), False):
                             continue
+                        evaluations += 1
+                        if evaluations > max_evaluations:
+                            logger.debug(
+                                "preferred resident-night swap search reached evaluation limit (%d)",
+                                max_evaluations,
+                            )
+                            return False
 
                         original_pref = _name_list(roster.at[pref_idx, "Assigned"])
                         original_donor = _name_list(roster.at[donor_idx, "Assigned"])
@@ -6175,6 +6313,195 @@ def auto_assign(
 
         return False
 
+    def _try_preferred_resident_night_cycle(
+        *,
+        protect_through_stage: str | None = None,
+        max_evaluations: int = 120,
+    ) -> bool:
+        """Restore one request with a bounded three-assignment displacement chain."""
+
+        current_objective = _resident_night_objective()
+        requests = sorted(
+            preferred_night_requests.items(),
+            key=lambda item: (
+                -item[1],
+                0 if item[0][1].weekday() in (4, 5) else 1,
+                _preferred_other_request_approval_percentage(item[0][0], item[0][1]),
+                item[0][1],
+                item[0][0],
+            ),
+        )
+        resident_rows = roster[roster["Shift"].isin(RESIDENT_NIGHT_SHIFTS)].copy()
+        if resident_rows.empty:
+            return False
+
+        third_assignments: list[tuple[int, date, str, str]] = []
+        for third_idx, third_row in resident_rows.iterrows():
+            third_date = date.fromisoformat(str(third_row.Date))
+            third_shift = str(third_row.Shift)
+            for third_name in _name_list(third_row.Assigned):
+                third_assignments.append(
+                    (int(third_idx), third_date, third_shift, third_name)
+                )
+
+        evaluations = 0
+        for (name, pref_date), _strength in requests:
+            if _preferred_night_request_is_fulfilled(name, pref_date):
+                continue
+            for pref_shift in sorted(
+                _preferred_night_shifts_for(name) & RESIDENT_NIGHT_SHIFTS
+            ):
+                pref_mask = (
+                    (roster["Date"] == pref_date.isoformat())
+                    & (roster["Shift"] == pref_shift)
+                )
+                if not pref_mask.any():
+                    continue
+                pref_idx = int(roster.index[pref_mask][0])
+                current_pref = _assigned_names(pref_idx)
+                needed = _to_int(roster.at[pref_idx, "Needed"], 0)
+                if needed <= 0 or len(current_pref) < needed:
+                    continue
+
+                donor_rows = resident_rows[
+                    resident_rows["Assigned"].astype(str).map(
+                        lambda cell: name in _name_list(cell)
+                    )
+                ]
+                for displaced in sorted(
+                    current_pref,
+                    key=lambda candidate: (
+                        _preferred_night_removal_order_cost(
+                            candidate,
+                            pref_shift,
+                            pref_date,
+                        ),
+                        candidate,
+                    ),
+                ):
+                    if displaced == name or _resident_assignment_is_protected(
+                        pref_date,
+                        pref_shift,
+                        displaced,
+                    ):
+                        continue
+                    for donor_idx, donor_row in donor_rows.iterrows():
+                        donor_idx = int(donor_idx)
+                        donor_date = date.fromisoformat(str(donor_row.Date))
+                        donor_shift = str(donor_row.Shift)
+                        if donor_idx == pref_idx or _resident_assignment_is_protected(
+                            donor_date,
+                            donor_shift,
+                            name,
+                        ):
+                            continue
+
+                        ordered_thirds = sorted(
+                            third_assignments,
+                            key=lambda item: (
+                                _preferred_night_removal_order_cost(
+                                    item[3],
+                                    item[2],
+                                    item[1],
+                                ),
+                                abs((item[1] - pref_date).days),
+                                item[1],
+                                item[3],
+                            ),
+                        )
+                        for third_idx, third_date, third_shift, third_name in ordered_thirds:
+                            if (
+                                third_idx in {pref_idx, donor_idx}
+                                or third_name in {name, displaced}
+                                or _resident_assignment_is_protected(
+                                    third_date,
+                                    third_shift,
+                                    third_name,
+                                )
+                                or not worker_shift_lut.get((third_name, donor_shift), False)
+                                or not worker_shift_lut.get((displaced, third_shift), False)
+                            ):
+                                continue
+                            evaluations += 1
+                            if evaluations > max_evaluations:
+                                logger.debug(
+                                    "preferred resident-night cycle search reached evaluation limit (%d)",
+                                    max_evaluations,
+                                )
+                                return False
+
+                            snapshot = roster["Assigned"].copy()
+                            original_pref = _assigned_names(pref_idx)
+                            original_donor = _assigned_names(donor_idx)
+                            original_third = _assigned_names(third_idx)
+                            if (
+                                displaced not in original_pref
+                                or name not in original_donor
+                                or third_name not in original_third
+                            ):
+                                continue
+
+                            roster.at[pref_idx, "Assigned"] = _write_name_list(
+                                [candidate for candidate in original_pref if candidate != displaced]
+                            )
+                            roster.at[donor_idx, "Assigned"] = _write_name_list(
+                                [candidate for candidate in original_donor if candidate != name]
+                            )
+                            roster.at[third_idx, "Assigned"] = _write_name_list(
+                                [candidate for candidate in original_third if candidate != third_name]
+                            )
+                            _rebuild_daily_assignments_from_roster()
+                            _rebuild_night_state_from_roster()
+                            _rebuild_live_counters_from_roster()
+
+                            if not (
+                                _resident_candidate_hard_legal(pref_idx, name)
+                                and _resident_candidate_hard_legal(donor_idx, third_name)
+                                and _resident_candidate_hard_legal(third_idx, displaced)
+                            ):
+                                _restore_resident_assignments(snapshot)
+                                continue
+
+                            roster.at[pref_idx, "Assigned"] = _write_name_list(
+                                _assigned_names(pref_idx) + [name]
+                            )
+                            roster.at[donor_idx, "Assigned"] = _write_name_list(
+                                _assigned_names(donor_idx) + [third_name]
+                            )
+                            roster.at[third_idx, "Assigned"] = _write_name_list(
+                                _assigned_names(third_idx) + [displaced]
+                            )
+                            _rebuild_daily_assignments_from_roster()
+                            _rebuild_night_state_from_roster()
+                            _rebuild_live_counters_from_roster()
+                            candidate_objective = _resident_night_objective()
+                            if (
+                                _resident_core_preserved_for_request_recovery(
+                                    current_objective.core,
+                                    candidate_objective.core,
+                                    protect_through_stage,
+                                )
+                                and _resident_preference_objective(candidate_objective)
+                                < _resident_preference_objective(current_objective)
+                            ):
+                                logger.info(
+                                    "preferred resident-night cycle: %s %s -> %s; "
+                                    "%s %s -> %s; %s %s -> %s",
+                                    pref_date.isoformat(),
+                                    displaced,
+                                    name,
+                                    donor_date.isoformat(),
+                                    name,
+                                    third_name,
+                                    third_date.isoformat(),
+                                    third_name,
+                                    displaced,
+                                )
+                                return True
+                            _restore_resident_assignments(snapshot)
+
+        return False
+
     def _repair_preferred_resident_night_requests(
         max_steps: int = 8,
         *,
@@ -6197,9 +6524,14 @@ def auto_assign(
             return 0
         repaired = 0
         for _ in range(max_steps):
-            if not _try_preferred_resident_night_swap(
+            changed = _try_preferred_resident_night_swap(
                 protect_through_stage=protect_through_stage,
-            ):
+                max_evaluations=180,
+            ) or _try_preferred_resident_night_cycle(
+                protect_through_stage=protect_through_stage,
+                max_evaluations=120,
+            )
+            if not changed:
                 if use_cache:
                     _remember_repair_noop(label)
                 break
@@ -6216,10 +6548,26 @@ def auto_assign(
         """Run one protected stage and recover requests across equal stage results."""
 
         before_preference = _preferred_night_miss_objective()
+        before_stale_competitions = _stale_preferred_request_competitions()
         changed = repair()
         after_preference = _preferred_night_miss_objective()
-        if after_preference <= before_preference:
+        newly_stale_competitions = (
+            _stale_preferred_request_competitions()
+            - before_stale_competitions
+        )
+        if (
+            after_preference <= before_preference
+            and not newly_stale_competitions
+        ):
             return changed
+
+        for request_key in newly_stale_competitions:
+            _record_preferred_night_event(
+                request_key,
+                "reconsidered",
+                stage=stage,
+                reason="original-competitor-displaced",
+            )
 
         restored = _repair_preferred_resident_night_requests(
             max_steps=min(12, max(4, len(preferred_night_requests))),
@@ -6233,6 +6581,28 @@ def auto_assign(
                 restored,
                 stage_label,
                 stage,
+            )
+        remaining_stale = (
+            newly_stale_competitions
+            & _stale_preferred_request_competitions()
+        )
+        for request_key in remaining_stale:
+            preferred_night_loss_stage[request_key] = stage
+            preferred_night_loss_detail.setdefault(request_key, {}).update({
+                "balance_scope": "others",
+                "alternative_search": "bounded-direct-swap-cycle",
+            })
+            _record_preferred_night_event(
+                request_key,
+                "reconsidered_unresolved",
+                stage=stage,
+                alternative_search="bounded-direct-swap-cycle",
+            )
+        for request_key in newly_stale_competitions - remaining_stale:
+            _record_preferred_night_event(
+                request_key,
+                "reconsidered_restored",
+                stage=stage,
             )
         return changed + restored
 
@@ -6389,11 +6759,9 @@ def auto_assign(
         return repaired
 
     def _try_resident_rolling_total_swap() -> bool:
-        pool = {
-            name
-            for name in _resident_night_pool()
-            if month_counts[name] > 0
-        }
+        """Compensate last month's workload inside the protected total stage."""
+
+        pool = _resident_night_pool()
         if not pool:
             return False
 
@@ -6403,8 +6771,7 @@ def auto_assign(
         if max(current_values) - min(current_values) > 1:
             return False
 
-        current_objective = _resident_night_objective()
-        current_weekend = _resident_weekend_objective()
+        before_metrics = _resident_priority_metrics()
         max_current = max(current_values)
         min_current = min(current_values)
         high_pool = {
@@ -6420,58 +6787,80 @@ def auto_assign(
             return False
 
         rows = roster[roster["Shift"].isin(RESIDENT_NIGHT_SHIFTS)].copy()
-        rows["_date"] = rows["Date"].map(lambda x: date.fromisoformat(str(x)))
-        rows["_weekend"] = rows["_date"].map(lambda d: 1 if d.weekday() in (4, 5) else 0)
-
-        for idx, row in rows.sort_values(["_weekend", "_date"], ascending=[True, False]).iterrows():
-            shift_date = row["_date"]
+        candidates: list[tuple[int, int, int, str, str, int, str]] = []
+        for idx, row in rows.iterrows():
+            shift_date = date.fromisoformat(str(row.Date))
             shift_type = str(row.Shift)
-            for high_name in sorted(
-                [name for name in _name_list(row.Assigned) if name in high_pool],
-                key=lambda n: (-rolling_counts[n], -previous_resident_night_counts[n], n),
-            ):
-                if _resident_assignment_is_protected(shift_date, shift_type, high_name):
+            for high_name in _name_list(row.Assigned):
+                if high_name not in high_pool:
                     continue
-                eligible_lows = {
-                    name for name in low_pool
-                    if rolling_counts[name] < rolling_counts[high_name]
-                }
-                if not eligible_lows:
-                    continue
-
-                assigned_snapshot = roster["Assigned"].copy()
-                if _try_replace_resident_night(
-                    idx,
+                candidates.append((
+                    _preferred_night_removal_order_cost(
+                        high_name,
+                        shift_type,
+                        shift_date,
+                    ),
+                    1 if shift_date.weekday() in (4, 5) else 0,
+                    -shift_date.toordinal(),
+                    shift_type,
                     high_name,
-                    preferred_names=eligible_lows,
-                        reason="resident rolling history balance repair",
-                        allow_sandwich=True,
-                        protect_weekend_objective=current_weekend,
-                        protect_weekend_history=_resident_weekend_history_load(),
-                    ):
-                    candidate_objective = _resident_night_objective()
-                    if _resident_history_tiebreak_improves(
-                        current_objective,
-                        candidate_objective,
-                    ):
-                        logger.info(
-                            "resident history tie-break: %s %s %s replaced; history %s -> %s",
-                            shift_date.isoformat(),
-                            shift_type,
-                            high_name,
-                            current_objective.history,
-                            candidate_objective.history,
-                        )
-                        return True
-                    roster["Assigned"] = assigned_snapshot
-                    _rebuild_daily_assignments_from_roster()
-                    _rebuild_night_state_from_roster()
-                    _rebuild_live_counters_from_roster()
+                    int(idx),
+                    shift_date.isoformat(),
+                ))
+
+        # A requested night is considered only after non-requested movable
+        # nights that deliver the same protected total/history improvement.
+        for _, _, _, shift_type, high_name, idx, shift_date_iso in sorted(
+            candidates,
+            key=lambda item: (
+                item[0],
+                item[1],
+                -rolling_counts[item[4]],
+                -previous_resident_night_counts[item[4]],
+                item[2],
+                item[4],
+            ),
+        ):
+            shift_date = date.fromisoformat(shift_date_iso)
+            if _resident_assignment_is_protected(shift_date, shift_type, high_name):
+                continue
+            eligible_lows = {
+                name for name in low_pool
+                if rolling_counts[name] < rolling_counts[high_name]
+            }
+            if not eligible_lows:
+                continue
+
+            assigned_snapshot = roster["Assigned"].copy()
+            if _try_replace_resident_night(
+                idx,
+                high_name,
+                preferred_names=eligible_lows,
+                reason="resident previous-month total compensation",
+                allow_sandwich=True,
+                require_preferred_names=True,
+                required_stage="total",
+            ):
+                after_metrics = _resident_priority_metrics()
+                if _resident_stage_improves(before_metrics, after_metrics, "total"):
+                    logger.info(
+                        "resident previous-month compensation: %s %s %s replaced; total %s -> %s",
+                        shift_date.isoformat(),
+                        shift_type,
+                        high_name,
+                        before_metrics.total,
+                        after_metrics.total,
+                    )
+                    return True
+                roster["Assigned"] = assigned_snapshot
+                _rebuild_daily_assignments_from_roster()
+                _rebuild_night_state_from_roster()
+                _rebuild_live_counters_from_roster()
 
         return False
 
     def _repair_resident_rolling_total_balance(max_steps: int = 20) -> int:
-        label = "resident_rolling_total_balance"
+        label = "resident_previous_month_total_compensation"
         if _repair_noop_cached(label):
             return 0
         repaired = 0
@@ -6717,7 +7106,7 @@ def auto_assign(
                 stage_weights["total"],
                 lambda: _run_resident_stage_repair(
                     "total",
-                    _repair_resident_night_balance,
+                    _repair_resident_total_priority,
                 ),
                 priority_stage="total",
             )
@@ -6816,13 +7205,31 @@ def auto_assign(
                 final_total_weight,
                 lambda: _run_resident_stage_repair(
                     "total",
-                    _repair_resident_night_balance,
+                    _repair_resident_total_priority,
                 ),
                 priority_stage="total",
             )
         if progress_start is not None and progress_end is not None:
             completed_progress_weight = total_progress_weight
             report_resident_progress("מסיים איזון תורנויות מתמחים")
+        return repaired
+
+    def _repair_resident_total_priority(
+        *,
+        balance_steps: int = 24,
+        search_evaluations: int = 300,
+        compensation_steps: int = 20,
+    ) -> int:
+        """Run current-month fairness, then identity-level history compensation."""
+
+        repaired = _repair_resident_night_balance(
+            max_steps=balance_steps,
+            search_evaluations=search_evaluations,
+        )
+        if _resident_night_total_objective()[0] <= 1:
+            repaired += _repair_resident_rolling_total_balance(
+                max_steps=compensation_steps,
+            )
         return repaired
 
     def _senior_other_friday_day_dates(name: str, d: date) -> set[date]:
@@ -8251,9 +8658,9 @@ def auto_assign(
                 marked += 1
         return marked
 
-    def _log_unmet_preferred_night_requests() -> dict[str, dict[str, str]]:
+    def _log_unmet_preferred_night_requests() -> dict[str, dict[str, object]]:
         _rebuild_daily_assignments_from_roster()
-        audit: dict[str, dict[str, str]] = {}
+        audit: dict[str, dict[str, object]] = {}
         for (name, pref_date), strength in sorted(
             preferred_night_requests.items(),
             key=lambda item: (-item[1], 0 if item[0][1].weekday() in (4, 5) else 1, item[0][1], item[0][0]),
@@ -8265,7 +8672,7 @@ def auto_assign(
 
             request_key = (name, pref_date)
             stage = preferred_night_loss_stage.get(request_key)
-            if stage in RESIDENT_PRIORITY_STAGES:
+            if stage in RESIDENT_PRIORITY_STAGES or stage == "protected_core":
                 cause = {
                     "reason_code": "higher_priority",
                     "priority_stage": stage,
@@ -8288,6 +8695,47 @@ def auto_assign(
                     "block": "no-causal-record",
                 }
             cause.update(preferred_night_loss_detail.get(request_key, {}))
+
+            # A seed-time competition is valid in the final explanation only
+            # when a preferred competitor still occupies the requested date.
+            # If the original winner disappeared, never export that stale name.
+            if cause.get("reason_code") == "request_competition":
+                final_competitors = _current_preferred_competitors(request_key)
+                if final_competitors:
+                    cause["competing_names"] = ", ".join(
+                        sorted(final_competitors)
+                    )
+                    cause["competition_revalidated"] = True
+                    cause["fixed_slot_present"] = any(
+                        _row_date(idx) == pref_date
+                        and any(
+                            (pref_date, str(roster.at[idx, "Shift"]), assigned_name)
+                            in fixed_assignment_keys
+                            for assigned_name in _assigned_names(idx)
+                        )
+                        for idx in resident_night_row_indexes
+                    )
+                else:
+                    if _preferred_request_all_compatible_slots_fixed(request_key):
+                        cause = {
+                            "reason_code": "hard_rule",
+                            "block": "fixed-slot-full",
+                            "final_state": True,
+                        }
+                    else:
+                        cause = {
+                            "reason_code": "diagnostic",
+                            "block": "stale-request-competition",
+                            "final_assignees": ", ".join(sorted({
+                                assigned_name
+                                for idx in resident_night_row_indexes
+                                if _row_date(idx) == pref_date
+                                for assigned_name in _assigned_names(idx)
+                            })),
+                        }
+
+            if preferred_night_events.get(request_key):
+                cause["event_chain"] = list(preferred_night_events[request_key])
 
             audit[f"{name}|{pref_date.isoformat()}"] = cause
 
@@ -8360,6 +8808,11 @@ def auto_assign(
             cause["competing_names"] = ", ".join(sorted(competing_names or set()))
             cause["fixed_slot_present"] = "fixed-slot-full" in blocks
         preferred_night_seed_blocks[(name, pref_date)] = cause
+        _record_preferred_night_event(
+            (name, pref_date),
+            "seed_rejected",
+            **cause,
+        )
 
     def _seed_preferred_night_requests() -> int:
         nonlocal filled_so_far
@@ -8539,6 +8992,11 @@ def auto_assign(
                 _record_preferred_night_assignment(name, shift_type, pref_date)
             preferred_night_seeded_requests.add((name, pref_date))
             preferred_night_seed_blocks.pop((name, pref_date), None)
+            _record_preferred_night_event(
+                (name, pref_date),
+                "seeded",
+                shift=shift_type,
+            )
 
             filled_so_far += 1
             seeded += 1
@@ -9098,7 +9556,7 @@ def auto_assign(
                     "total",
                     lambda: _run_resident_stage_repair(
                         "total",
-                        _repair_resident_night_balance,
+                        _repair_resident_total_priority,
                     ),
                     stage_label="final resident total invariant",
                 ),
@@ -9168,9 +9626,10 @@ def auto_assign(
                     "total",
                     lambda: _run_resident_stage_repair(
                         "total",
-                        lambda: _repair_resident_night_balance(
-                            max_steps=40,
+                        lambda: _repair_resident_total_priority(
+                            balance_steps=40,
                             search_evaluations=1200,
+                            compensation_steps=20,
                         ),
                     ),
                     stage_label="absolute-final resident total fairness",
@@ -9210,19 +9669,21 @@ def auto_assign(
             "Final preferred-request distribution changed %d assignments across exact protected-core ties",
             final_request_fairness_repairs,
         )
-    report_progress(97, "\u05de\u05db\u05e8\u05d9\u05e2 \u05dc\u05e4\u05d9 \u05d4\u05d9\u05e1\u05d8\u05d5\u05e8\u05d9\u05d4 \u05d1\u05de\u05e6\u05d1\u05d9 \u05e9\u05d5\u05d5\u05d9\u05d5\u05df")
-    resident_history_repairs = timed_repair(
-        "resident_history_tiebreak",
-        lambda: _run_tracking_preferred_night_losses(
-            lambda: _repair_resident_rolling_total_balance(max_steps=20),
-            expected_stage="history",
-        ),
-    )
-    if resident_history_repairs:
-        logger.info(
-            "Resident history tie-break changed %d assignments without changing the protected core",
-            resident_history_repairs,
+    for request_key in _stale_preferred_request_competitions():
+        if _preferred_request_all_compatible_slots_fixed(request_key):
+            continue
+        preferred_night_loss_stage[request_key] = "protected_core"
+        preferred_night_loss_detail.setdefault(request_key, {}).update({
+            "balance_scope": "others",
+            "alternative_search": "bounded-direct-swap-cycle",
+        })
+        _record_preferred_night_event(
+            request_key,
+            "final_reconsideration_unresolved",
+            stage="protected_core",
+            alternative_search="bounded-direct-swap-cycle",
         )
+    report_progress(97, "מסיים בדיקות איזון")
     final_weekend_konen_pairs = _repair_weekend_konen_pairs()
     if final_weekend_konen_pairs:
         logger.info(

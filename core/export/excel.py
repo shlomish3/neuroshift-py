@@ -274,6 +274,7 @@ _PREFERRED_AUDIT_BLOCK_HE = {
     "no-seed-candidate": "לא נמצא מועמד חוקי בשלב הזריעה",
     "seeded-then-untracked-removal": "הבקשה נזרעה אך הוסרה מחוץ לשלבי האיזון המתועדים",
     "no-causal-record": "לא נשמר רישום סיבתי להרצה זו",
+    "stale-request-competition": "המתחרה המקורי הוסר והבקשה לא קיבלה סיבה סופית תקפה",
 }
 
 _RESIDENT_PRIORITY_LABELS_HE = {
@@ -284,6 +285,7 @@ _RESIDENT_PRIORITY_LABELS_HE = {
     "sandwich_total": "צמצום מספר הסנדוויצ'ים",
     "sandwich_distribution": "חלוקת הסנדוויצ'ים",
     "shift_type": "איזון ת.מיון מול ת.מיון 2",
+    "protected_core": "שמירת מכלול האיזונים המוגנים",
 }
 
 _RESIDENT_SOFT_PRIORITY_LABELS_HE = {
@@ -1409,9 +1411,14 @@ def _unmet_preferred_request_rows(
                     else:
                         scope_label = ""
                     scope_suffix = f" ({scope_label})" if scope_label else ""
+                    search_suffix = (
+                        "; לא נמצאה חלופה חוקית שוות־איזון ששומרת את הבקשה"
+                        if causal.get("alternative_search")
+                        else ""
+                    )
                     reason = (
                         f"ויתור לטובת עדיפות מוגנת: {priority_label}"
-                        f"{scope_suffix}"
+                        f"{scope_suffix}{search_suffix}"
                     )
                 else:
                     reason_code = "diagnostic"
@@ -1462,7 +1469,8 @@ def _unmet_preferred_request_rows(
                 block = str(causal.get("block") or "no-causal-record")
                 block_label = _PREFERRED_AUDIT_BLOCK_HE.get(block, block)
                 if reason_code == "hard_rule":
-                    reason = f"כלל קשיח בעת הזריעה: {block_label}"
+                    timing = "" if causal.get("final_state") else " בעת הזריעה"
+                    reason = f"כלל קשיח{timing}: {block_label}"
                 else:
                     reason_code = "diagnostic"
                     reason = f"דורש בדיקה: {block_label}"
