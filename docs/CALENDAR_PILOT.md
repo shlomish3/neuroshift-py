@@ -11,6 +11,11 @@ No roster generation, source-workbook edits or worker notifications were perform
 - Owner: `shamir.neuroshift@gmail.com`, verified through Google identity and
   owner-only permissions on the new source Sheet.
 - [Private calendar Sheet](https://docs.google.com/spreadsheets/d/1VW_m4Os86AldMCgrK1pYgRAOQv7BxHBlyQPr5Ry_rIQ/edit)
+- Renamed **Neuroshift - יומנים אישיים**; the former TEST/month data tab is now
+  **נתוני שיבוצים**. Both tabs are permanent and reused across published months.
+- On renaming, live permissions also included the user's `shlomi9994@gmail.com`
+  as editor. This existing access is preserved and explicitly accepted by the
+  publisher; the original NeuroShift ownership and non-public access remain required.
 - **קישורי יומנים** in that Sheet lists all 18 workers, their calendar names and
   copyable subscription URLs. The app maintains it after successful publishing;
   **עדכון גיליון הקישורים** also refreshes it without redeploying calendars.

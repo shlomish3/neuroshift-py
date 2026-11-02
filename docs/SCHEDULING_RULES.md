@@ -19,6 +19,11 @@ worker names, calendar names and permanent subscription URLs. Preserve it on
 future publications and update it only from successfully published links. The
 app's **עדכון גיליון הקישורים** refreshes it without generating a roster or
 redeploying calendar feeds; do not put this directory in the scheduler input Sheet.
+The spreadsheet is named **Neuroshift - יומנים אישיים**, with permanent tabs
+**נתוני שיבוצים** and **קישורי יומנים**, reused across months. Publishing replaces
+only the selected month's events and preserves other months and personal links.
+Resource access checks accept NeuroShift ownership plus the user's existing
+`shlomi9994@gmail.com` editor access; other users/public/domain sharing remain blocked.
 
 Calendar hours confirmed by the user on 2026-11-02 (Asia/Jerusalem): both resident
 night types start at 16:00 Sunday-Thursday, 13:00 Fridays/holiday eves, and 09:00

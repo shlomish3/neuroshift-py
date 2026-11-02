@@ -6,10 +6,12 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
-from core.calendar_publisher import CalendarPublisher, StateStore, published_months
+from core.calendar_publisher import (CalendarPublisher, StateStore, published_months,
+                                     GoogleCalendarCloud, OWNER, SHEET_TITLE)
 from core.personal_calendars import (event_uid, holiday_day_types, local_string,
                                     make_event, read_workbook, render_calendar,
                                     calendar_name, calendar_filename, escape)
@@ -383,6 +385,29 @@ class CalendarPublisherTests(unittest.TestCase):
                 self.assertEqual(event['Shift'], 'כונן מיון')
                 self.assertEqual(date.fromisoformat(event['Date']).weekday(), 4)
         self.assertFalse(self.publisher.refresh_published_settings().changed)
+
+
+class CalendarResourceNameTests(unittest.TestCase):
+    def test_permanent_and_legacy_names_require_private_expected_owner(self):
+        cloud = object.__new__(GoogleCalendarCloud)
+        for title in (SHEET_TITLE, 'NeuroShift Calendar TEST 2026-11'):
+            metadata = dict(name=title, mimeType='application/vnd.google-apps.spreadsheet',
+                            owners=[{'emailAddress': OWNER}],
+                            permissions=[{'type': 'user', 'role': 'owner', 'emailAddress': OWNER}])
+            cloud._json = Mock(return_value=metadata)
+            cloud.check_resources({'sheet_id': 'expected-sheet'})
+            metadata['permissions'].append({'type': 'user', 'role': 'writer', 'emailAddress': 'shlomi9994@gmail.com'})
+            cloud.check_resources({'sheet_id': 'expected-sheet'})
+            metadata['permissions'].append({'type': 'user', 'role': 'reader', 'emailAddress': 'unknown@example.test'})
+            with self.assertRaises(RuntimeError):
+                cloud.check_resources({'sheet_id': 'expected-sheet'})
+            metadata['permissions'].pop()
+            metadata['permissions'].append({'type': 'anyone', 'role': 'reader'})
+            with self.assertRaises(RuntimeError):
+                cloud.check_resources({'sheet_id': 'expected-sheet'})
+        metadata.update(name='Unrelated spreadsheet', permissions=[])
+        with self.assertRaises(RuntimeError):
+            cloud.check_resources({'sheet_id': 'expected-sheet'})
 
 
 if __name__ == '__main__':

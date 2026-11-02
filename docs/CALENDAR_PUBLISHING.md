@@ -21,7 +21,8 @@ worker name, `Neuroshift - <worker>` calendar name and a copyable subscription U
 Use this Sheet rather than the scheduler's input Sheet for sharing links. It is
 updated after successful publications, preserving permanent links. The app's
 **עדכון גיליון הקישורים** button refreshes this directory independently, without
-choosing a workbook or publishing calendars. The Sheet remains owner-only;
+choosing a workbook or publishing calendars. The Sheet is private to the owner
+and the user's personal account;
 copy each worker's individual URL rather than sharing the whole directory.
 
 On 2026-11-02 the user authorized sharing the calendars with workers. Version 4
@@ -82,13 +83,19 @@ Naming references: [RFC 7986 NAME](https://www.rfc-editor.org/rfc/rfc7986.html#s
   preventing it from overwriting the GUI's multi-month snapshots.
 - Publishing uses the already saved Apps Script account connection in the user's
   `.clasprc.json`, refreshed in memory only. It verifies
-  `shamir.neuroshift@gmail.com` and the owner-only pilot Sheet on every changed
+  `shamir.neuroshift@gmail.com` and the private calendar Sheet on every changed
   publication. No credential contents or full personal URLs are logged. A missing
   or revoked connection stops publishing with an explanatory message.
-- The private backend resources retain their historical internal TEST names;
-  these are not calendar/event labels. The resource check still verifies the
-  original owner-only Sheet and the same resource IDs. Do not rename resources
-  without updating that check.
+- The private spreadsheet is named **Neuroshift - יומנים אישיים**. Its two
+  permanent tabs are **נתוני שיבוצים** (all published months together) and
+  **קישורי יומנים**. Publishing a month reuses these tabs, replacing that month's
+  events while keeping other months. No monthly tabs or new subscription URLs
+  are created. Resource checks still verify the same Sheet ID and owner and
+  accept the old pilot name for compatibility. The separate internal Apps Script
+  project retains its historical name.
+  As verified during renaming, the user also shares this Sheet with
+  `shlomi9994@gmail.com` as editor. This specific existing access is accepted;
+  unknown users, public access and domain sharing still stop publication.
 - The publisher exports the private Sheet as XLSX, replaces only its assignment
   table, imports the workbook back into the same Google Sheet and checks readback.
   Other tabs, including **קישורי יומנים**, are retained. After successful Apps

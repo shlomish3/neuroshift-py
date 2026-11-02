@@ -20,6 +20,8 @@ from core.calendar_sheet import (XLSX_MIME, LINKS_TAB, update_workbook,
 ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / '.calendar-pilot' / 'state.json'
 OWNER = 'shamir.neuroshift@gmail.com'
+SHEET_TITLE = 'Neuroshift - יומנים אישיים'
+SHEET_USER_ROLES = {OWNER: 'owner', 'shlomi9994@gmail.com': 'writer'}
 NAMING_VERSION = 2
 HANDLER = '''function doGet(e) {
   var key = e && e.parameter && e.parameter.key;
@@ -158,10 +160,12 @@ class GoogleCalendarCloud:
     def check_resources(self, state: dict) -> None:
         meta = self._json('GET', 'https://www.googleapis.com/drive/v3/files/' + state['sheet_id'],
                params={'fields': 'name,mimeType,owners(emailAddress),permissions(type,role,emailAddress)'})
-        if (not meta.get('name', '').startswith('NeuroShift Calendar TEST')
+        if ((meta.get('name') != SHEET_TITLE
+                and not meta.get('name', '').startswith('NeuroShift Calendar TEST'))
                 or meta.get('mimeType') != 'application/vnd.google-apps.spreadsheet'
                 or [o.get('emailAddress') for o in meta.get('owners', [])] != [OWNER]
-                or any(p.get('type') != 'user' or p.get('emailAddress') != OWNER
+                or any(p.get('type') != 'user'
+                       or p.get('role') != SHEET_USER_ROLES.get(p.get('emailAddress'), '__unrecognized__')
                        for p in meta.get('permissions', []))):
             raise RuntimeError('גיליון היומנים אינו הגיליון הפרטי הצפוי. הפרסום נעצר.')
 
