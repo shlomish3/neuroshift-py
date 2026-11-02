@@ -23,6 +23,15 @@ No roster generation, source-workbook edits or worker notifications were perform
   copyable subscription URLs. The app maintains it after successful publishing;
   **עדכון גיליון הקישורים** also refreshes it without redeploying calendars.
 - [Separate Apps Script project](https://script.google.com/home/projects/1eAN4dbKx3rk7Y9_lCLoySwesoLWwGL0UOUH6_vuR32tABWD5pHBmIBFG/edit)
+- The user shared this script with `shlomi9994@gmail.com`; live Drive metadata
+  confirms editor access and unchanged `shamir.neuroshift@gmail.com` ownership.
+  Its current title is still `NeuroShift Calendar TEST 2026-11`. The requested
+  title is `05 Neuroshift - יומנים אישיים app script`, pending a manual rename.
+  The existing publishing connection reports `isAppAuthorized=false` for this
+  script file: Drive sharing/rename requests return 403 despite account ownership.
+  Sharing with the personal account does not grant this OAuth app file access.
+  Native Chrome control cannot verify the page URL; the available in-app browser
+  is not signed in. Do not repeat these failed paths without a relevant change.
 - Deployed version 6 serves the same 18 secret personal calendar links, covering 94 actual
   duties. Test labels were removed from names/titles at the user's request. Event
   identities, duty times and free/busy transparency were preserved.
