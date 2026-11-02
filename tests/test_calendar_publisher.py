@@ -390,7 +390,7 @@ class CalendarPublisherTests(unittest.TestCase):
 class CalendarResourceNameTests(unittest.TestCase):
     def test_permanent_and_legacy_names_require_private_expected_owner(self):
         cloud = object.__new__(GoogleCalendarCloud)
-        for title in (SHEET_TITLE, 'NeuroShift Calendar TEST 2026-11'):
+        for title in (SHEET_TITLE, 'Neuroshift - יומנים אישיים', 'NeuroShift Calendar TEST 2026-11'):
             metadata = dict(name=title, mimeType='application/vnd.google-apps.spreadsheet',
                             owners=[{'emailAddress': OWNER}],
                             permissions=[{'type': 'user', 'role': 'owner', 'emailAddress': OWNER}])

@@ -20,7 +20,7 @@ from core.calendar_sheet import (XLSX_MIME, LINKS_TAB, update_workbook,
 ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / '.calendar-pilot' / 'state.json'
 OWNER = 'shamir.neuroshift@gmail.com'
-SHEET_TITLE = 'Neuroshift - יומנים אישיים'
+SHEET_TITLE = '05 Neuroshift - יומנים אישיים'
 SHEET_USER_ROLES = {OWNER: 'owner', 'shlomi9994@gmail.com': 'writer'}
 NAMING_VERSION = 2
 HANDLER = '''function doGet(e) {
@@ -160,7 +160,7 @@ class GoogleCalendarCloud:
     def check_resources(self, state: dict) -> None:
         meta = self._json('GET', 'https://www.googleapis.com/drive/v3/files/' + state['sheet_id'],
                params={'fields': 'name,mimeType,owners(emailAddress),permissions(type,role,emailAddress)'})
-        if ((meta.get('name') != SHEET_TITLE
+        if ((meta.get('name') not in (SHEET_TITLE, 'Neuroshift - יומנים אישיים')
                 and not meta.get('name', '').startswith('NeuroShift Calendar TEST'))
                 or meta.get('mimeType') != 'application/vnd.google-apps.spreadsheet'
                 or [o.get('emailAddress') for o in meta.get('owners', [])] != [OWNER]

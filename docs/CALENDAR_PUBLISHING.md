@@ -86,12 +86,16 @@ Naming references: [RFC 7986 NAME](https://www.rfc-editor.org/rfc/rfc7986.html#s
   `shamir.neuroshift@gmail.com` and the private calendar Sheet on every changed
   publication. No credential contents or full personal URLs are logged. A missing
   or revoked connection stops publishing with an explanatory message.
-- The private spreadsheet is named **Neuroshift - יומנים אישיים**. Its two
+- The private spreadsheet is named **05 Neuroshift - יומנים אישיים**, stored in
+  the shared project Drive folder **סידורי עבודה/Google sheets**, alongside Sheets
+  01–04. Its local `.gsheet` entry opens the same cloud file. NeuroShift remains
+  owner and the personal account remains editor; no duplicate Sheet was created.
+  Its two
   permanent tabs are **נתוני שיבוצים** (all published months together) and
   **קישורי יומנים**. Publishing a month reuses these tabs, replacing that month's
   events while keeping other months. No monthly tabs or new subscription URLs
   are created. Resource checks still verify the same Sheet ID and owner and
-  accept the old pilot name for compatibility. The separate internal Apps Script
+  accept the former unnumbered/pilot names for compatibility. The separate internal Apps Script
   project retains its historical name.
   As verified during renaming, the user also shares this Sheet with
   `shlomi9994@gmail.com` as editor. This specific existing access is accepted;
