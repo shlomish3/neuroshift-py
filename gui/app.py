@@ -123,6 +123,7 @@ class NeuroShiftApp(tk.Tk):
         self._queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._busy = False
         self._logo_image: tk.PhotoImage | None = None
+        self._calendar_window = None
         self._spinner_frames = ["|", "/", "-", "\\"]
         self._spinner_index = 0
         self._progress_label = ""
@@ -139,13 +140,13 @@ class NeuroShiftApp(tk.Tk):
         self.month_var = tk.StringVar(value=f"{default_month:02d}")
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_OUT_DIR))
         self.finalized_file_var = tk.StringVar()
-        self.optimize_file_var = tk.StringVar()
         self.state_var = tk.StringVar(value=rtl("ממתין לפעולה"))
         self.progress_var = tk.DoubleVar(value=0)
 
         self._build()
         self._load_logo_async()
         self.after(100, self._drain_queue)
+        self.protocol("WM_DELETE_WINDOW", self._close_app)
 
     def _build(self) -> None:
         self._configure_style()
@@ -159,6 +160,9 @@ class NeuroShiftApp(tk.Tk):
 
         title = ttk.Label(header, text="Neuro Shift", style="Title.TLabel")
         title.grid(row=0, column=0, sticky="w")
+
+        ttk.Button(header, text=rtl("יומנים אישיים"), command=self._open_calendars).grid(
+            row=0, column=1, sticky="e", padx=16)
 
         self.logo_label = ttk.Label(header, text="שמיר", style="LogoPlaceholder.TLabel")
         self.logo_label.grid(row=0, column=2, sticky="e")
@@ -211,21 +215,6 @@ class NeuroShiftApp(tk.Tk):
         ttk.Button(month_box, text="בחירה", command=self._browse_output_dir).grid(row=1, column=3, sticky="e")
         ttk.Button(month_box, text="צור סידור", command=self._generate_roster, style="Accent.TButton").grid(row=1, column=4, sticky="e", padx=(12, 0))
         month_box.columnconfigure(2, weight=1)
-
-        optimize_box = ttk.LabelFrame(
-            root,
-            text=rtl("שיפור סידור קיים"),
-            padding=14,
-            style="Card.TLabelframe",
-            labelanchor="ne",
-        )
-        optimize_box.pack(fill=tk.X, pady=(14, 0))
-
-        ttk.Label(optimize_box, text="קובץ סידור לניתוח").grid(row=0, column=0, sticky="e")
-        ttk.Entry(optimize_box, textvariable=self.optimize_file_var).grid(row=1, column=0, sticky="ew", padx=(0, 8))
-        ttk.Button(optimize_box, text="בחירה", command=self._browse_optimize_file).grid(row=1, column=1, sticky="e")
-        ttk.Button(optimize_box, text="שפר סידור", command=self._optimize_roster, style="Accent.TButton").grid(row=1, column=2, sticky="e", padx=(12, 0))
-        optimize_box.columnconfigure(0, weight=1)
 
         status_box = ttk.LabelFrame(
             root,
@@ -338,6 +327,22 @@ class NeuroShiftApp(tk.Tk):
         if picked:
             self.output_dir_var.set(picked)
 
+    def _open_calendars(self) -> None:
+        if self._calendar_window is not None and self._calendar_window.winfo_exists():
+            self._calendar_window.lift()
+            self._calendar_window.focus_set()
+            return
+        from gui.calendar_window import CalendarWindow
+        self._calendar_window = CalendarWindow(self)
+
+    def _close_app(self) -> None:
+        if (self._calendar_window is not None and self._calendar_window.winfo_exists()
+                and self._calendar_window._busy):
+            self._calendar_window.lift()
+            self._calendar_window.status_var.set("פעולת היומנים עדיין פועלת. אפשר לסגור את האפליקציה לאחר סיומה.")
+            return
+        self.destroy()
+
     def _browse_finalized_file(self) -> None:
         picked = filedialog.askopenfilename(
             title="בחירת סידור סופי",
@@ -346,15 +351,6 @@ class NeuroShiftApp(tk.Tk):
         )
         if picked:
             self.finalized_file_var.set(picked)
-
-    def _browse_optimize_file(self) -> None:
-        picked = filedialog.askopenfilename(
-            title="בחירת סידור לשיפור",
-            filetypes=[("קבצי Excel", "*.xlsx *.xlsm"), ("כל הקבצים", "*.*")],
-            initialdir=str(DEFAULT_OUT_DIR),
-        )
-        if picked:
-            self.optimize_file_var.set(picked)
 
     def _run_background(self, label: str, fn) -> None:
         if self._busy:
@@ -391,6 +387,12 @@ class NeuroShiftApp(tk.Tk):
                 self._queue.put(("progress", (percent, label)))
 
             roster = auto_assign(month, progress_callback=progress)
+            for shortfall in roster.attrs.get("resident_night_minimum_shortfalls", []):
+                self._queue.put(("log", (
+                    f"מכסה מינימלית לא הושלמה: {shortfall['name']} — "
+                    f"שובצו {shortfall['assigned']} מתוך {shortfall['minimum']}. "
+                    + str(shortfall.get("reason") or "")
+                )))
             notice = _history_notice(month)
             if notice:
                 self._queue.put(("log", notice))
@@ -398,7 +400,6 @@ class NeuroShiftApp(tk.Tk):
             _refresh_excel_template_if_needed()
             progress(99, "מייצא קובץ Excel")
             path = export_month_to_xlsx(roster, month=month, out_dir=out_dir)
-            self._queue.put(("optimize_file", str(path)))
             progress(100, "הסתיים")
             return f"הסידור נוצר: {path}"
 
@@ -427,44 +428,12 @@ class NeuroShiftApp(tk.Tk):
 
         self._run_background("…שומר נתוני סידור בהיסטוריה", task)
 
-    def _optimize_roster(self) -> None:
-        path = self.optimize_file_var.get().strip()
-        if not path:
-            messagebox.showerror("Neuro Shift", "יש לבחור קובץ סידור לשיפור.")
-            return
-        try:
-            source = Path(path)
-            _assert_excel_target_available(source.with_name(f"{source.stem}_optimized.xlsm"))
-        except Exception as exc:
-            messagebox.showerror("Neuro Shift", str(exc))
-            return
-
-        def task() -> str:
-            from core.optimizer import optimize_exported_roster
-
-            def progress(percent: int, label: str) -> None:
-                self._queue.put(("progress", (percent, label)))
-
-            out_path, summary = optimize_exported_roster(path, progress_callback=progress)
-            self._queue.put(("optimize_file", str(out_path)))
-            warning_count = len(summary.get("warnings", []))
-            return (
-                f"נוצר סידור משופר: {out_path}\n"
-                f"הושלמו {summary.get('hard_filled', 0)} שיבוצי מיון/ייעוצים חסרים. "
-                f"אזהרות רצף תורנויות: {warning_count}."
-            )
-
-        self._run_background("…משפר סידור קיים", task)
-
     def _drain_queue(self) -> None:
         try:
             while True:
                 kind, message = self._queue.get_nowait()
                 if kind == "logo":
                     self._set_logo(str(message))
-                    continue
-                if kind == "optimize_file":
-                    self.optimize_file_var.set(str(message))
                     continue
                 if kind == "progress":
                     percent, label = message

@@ -3,3 +3,4 @@ openpyxl
 gspread
 google-auth
 requests
+tzdata

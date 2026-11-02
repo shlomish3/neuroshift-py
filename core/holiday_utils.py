@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Dict
+from typing import Collection, Dict
 
 import pandas as pd
 
@@ -46,8 +46,17 @@ def _is_rest_type(kind: str) -> bool:
     return "חופש" in kind
 
 
+def _is_no_eve_rest_type(kind: str) -> bool:
+    normalized = " ".join(_clean(kind).split())
+    return _is_rest_type(normalized) and "ללא ערב חג" in normalized
+
+
 def _is_erev_rest_type(kind: str) -> bool:
-    return _is_rest_type(kind) and "ערב" in kind
+    return (
+        _is_rest_type(kind)
+        and "ערב" in kind
+        and not _is_no_eve_rest_type(kind)
+    )
 
 
 def _is_erev_name(name: str) -> bool:
@@ -108,6 +117,26 @@ def holiday_eve_names_from_tables(tables: dict) -> Dict[date, str]:
     return out
 
 
+def holiday_no_eve_dates_from_tables(tables: dict) -> set[date]:
+    """Return full rest days that must not create an inferred holiday eve.
+
+    A row whose ``סוג`` is ``חופש ללא ערב חג`` remains a full rest day itself,
+    but the preceding calendar day keeps its real weekday requirements.
+    """
+
+    dates, hol_df, name_col = _holiday_source(tables)
+    if hol_df.empty or "סוג" not in hol_df.columns:
+        return set()
+
+    out: set[date] = set()
+    for idx, d in dates.dropna().items():
+        kind = _holiday_type(hol_df, idx)
+        name = _holiday_name(hol_df, idx, name_col, "חג")
+        if _is_no_eve_rest_type(kind) and not _is_erev_name(name):
+            out.add(d)
+    return out
+
+
 def holiday_display_names_from_tables(tables: dict) -> Dict[date, str]:
     """
     Return all named holidays/informational dates from the חגים table.
@@ -131,20 +160,41 @@ def holiday_display_names_from_tables(tables: dict) -> Dict[date, str]:
     return out
 
 
+def is_holiday_eve_date(
+    d: date,
+    holiday_names: Dict[date, str],
+    holiday_eve_names: Dict[date, str] | None = None,
+    holiday_no_eve_dates: Collection[date] | None = None,
+) -> bool:
+    """Return whether *d* should use Friday-equivalent holiday-eve behavior."""
+
+    holiday_eve_names = holiday_eve_names or {}
+    holiday_no_eve_dates = holiday_no_eve_dates or set()
+    if d in holiday_eve_names:
+        return True
+    next_day = d + timedelta(days=1)
+    return next_day in holiday_names and next_day not in holiday_no_eve_dates
+
+
 def effective_weekday_letter(
     d: date,
     holiday_names: Dict[date, str],
     holiday_eve_names: Dict[date, str] | None = None,
+    holiday_no_eve_dates: Collection[date] | None = None,
 ) -> str:
     """
     Required-count weekday for scheduling:
     - actual holiday/rest day -> שבת
-    - day before holiday -> שישי
+    - day before holiday -> שישי, unless the holiday is חופש ללא ערב חג
     - otherwise the real weekday
     """
-    holiday_eve_names = holiday_eve_names or {}
     if d in holiday_names:
         return "ש"
-    if d in holiday_eve_names or d + timedelta(days=1) in holiday_names:
+    if is_holiday_eve_date(
+        d,
+        holiday_names,
+        holiday_eve_names,
+        holiday_no_eve_dates,
+    ):
         return "ו"
     return ["ב", "ג", "ד", "ה", "ו", "ש", "א"][d.isoweekday() - 1]

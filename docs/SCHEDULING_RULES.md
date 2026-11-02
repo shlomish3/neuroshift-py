@@ -2,6 +2,29 @@
 
 This document is the canonical collective memory for scheduling behavior agreed during the NeuroShift project chats. Future changes should improve the existing working scheduler incrementally, not replace it. When a later explicit user instruction conflicts with this document, the later instruction wins and this document should be updated.
 
+For the personal-calendar project, cloud resources and live test status,
+see [CALENDAR_PILOT.md](CALENDAR_PILOT.md). The app now exposes workbook selection,
+change preview, explicit publishing and existing pilot links through **יומנים אישיים**;
+see [CALENDAR_PUBLISHING.md](CALENDAR_PUBLISHING.md). This workflow never generates
+or optimizes a roster. On 2026-11-02 the user authorized removing calendar test
+labels for sharing with workers, preserving all subscription URLs. Future
+publications must remain without בדיקה/TEST labels. The unused **שיפור סידור קיים**
+option and its handlers were removed entirely from the app at the user's request.
+Personal calendar names use exactly `Neuroshift - <worker>` (lowercase s),
+independent of the published month. Preserve existing subscription URLs when
+updating this metadata; Google's client-selected display name still requires
+client verification and may need a manual rename.
+
+Calendar hours confirmed by the user on 2026-11-02 (Asia/Jerusalem): both resident
+night types start at 16:00 Sunday-Thursday, 13:00 Fridays/holiday eves, and 09:00
+Saturdays/full holidays (חופש). Weekday/Friday/eve resident duties end at 10:00 the
+next day; Saturday/full-holiday resident duties end at 08:00 the next day. Senior
+כונן מיון and כ.שבץ use 15:00-08:00 on ordinary Sunday-Thursday and weekday eves,
+13:00-09:00 on Fridays, and 09:00-08:00 on Saturdays/full holidays. Full-holiday
+hours override Friday hours. Informational holidays do not change hours.
+The calendar pilot also imports populated כ.שבץ cells from the final duty sheet;
+this does not add a new generated duty or alter any scheduler assignment.
+
 ## General Precedence
 
 Use this order when rules compete:
