@@ -95,8 +95,11 @@ Naming references: [RFC 7986 NAME](https://www.rfc-editor.org/rfc/rfc7986.html#s
   **קישורי יומנים**. Publishing a month reuses these tabs, replacing that month's
   events while keeping other months. No monthly tabs or new subscription URLs
   are created. Resource checks still verify the same Sheet ID and owner and
-  accept the former unnumbered/pilot names for compatibility. The separate internal Apps Script
-  project retains its historical name.
+  accept the former unnumbered/pilot names for compatibility. The separate Apps
+  Script project is **05 Neuroshift - יומנים אישיים app script**. The user renamed
+  it manually; live verification confirmed the same project/deployment IDs and
+  all 18 permanent links still serving the same 94 duties. Publication uses IDs
+  rather than the script project's display name.
   As verified during renaming, the user also shares this Sheet with
   `shlomi9994@gmail.com` as editor. This specific existing access is accepted;
   unknown users, public access and domain sharing still stop publication.
