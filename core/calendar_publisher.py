@@ -6,9 +6,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import csv
 import hashlib
-import io
 import json
 from pathlib import Path
 import secrets
@@ -16,11 +14,12 @@ from urllib.parse import urlencode
 
 from core.personal_calendars import (WorkbookDuties, event_changes, holiday_day_types,
                                     make_event, read_workbook, render_calendar, calendar_filename, POLICY)
+from core.calendar_sheet import (XLSX_MIME, LINKS_TAB, update_workbook,
+                                 read_snapshot, read_subscription_rows, subscription_rows)
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / '.calendar-pilot' / 'state.json'
 OWNER = 'shamir.neuroshift@gmail.com'
-TABLE_FIELDS = ['Date', 'Shift', 'Name', 'SourceCell', 'Start', 'End', 'DayType']
 NAMING_VERSION = 2
 HANDLER = '''function doGet(e) {
   var key = e && e.parameter && e.parameter.key;
@@ -166,26 +165,45 @@ class GoogleCalendarCloud:
                        for p in meta.get('permissions', []))):
             raise RuntimeError('גיליון היומנים אינו הגיליון הפרטי הצפוי. הפרסום נעצר.')
 
-    def upload_snapshot(self, state: dict, events: list[dict]) -> None:
-        output = io.StringIO(newline='')
-        writer = csv.DictWriter(output, fieldnames=TABLE_FIELDS, lineterminator='\r\n')
-        writer.writeheader()
-        writer.writerows(events)
+    def _export_workbook(self, state: dict) -> bytes:
+        response = self.client.get('https://www.googleapis.com/drive/v3/files/' + state['sheet_id'] + '/export',
+                                   params={'mimeType': XLSX_MIME}, timeout=30)
+        if not response.ok:
+            raise RuntimeError('לא ניתן לקרוא את גיליון היומנים. לא בוצע עדכון.')
+        return response.content
+
+    def _upload_workbook(self, state: dict, content: bytes) -> bytes:
         boundary = 'neuroshift_' + secrets.token_hex(12)
         body = (f'--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'
                 + json.dumps({'mimeType': 'application/vnd.google-apps.spreadsheet'})
-                + f'\r\n--{boundary}\r\nContent-Type: text/csv; charset=UTF-8\r\n\r\n'
-                + output.getvalue() + f'\r\n--{boundary}--\r\n').encode('utf-8')
+                + f'\r\n--{boundary}\r\nContent-Type: {XLSX_MIME}\r\n\r\n').encode('utf-8')
+        body += content + f'\r\n--{boundary}--\r\n'.encode('ascii')
         self._json('PATCH', 'https://www.googleapis.com/upload/drive/v3/files/' + state['sheet_id'],
                    params={'uploadType': 'multipart', 'fields': 'id'},
                    headers={'Content-Type': 'multipart/related; boundary=' + boundary}, data=body)
-        response = self.client.get('https://www.googleapis.com/drive/v3/files/' + state['sheet_id'] + '/export',
-                                   params={'mimeType': 'text/csv'}, timeout=30)
-        if not response.ok:
-            raise RuntimeError('לא ניתן לבדוק את השיבוצים לאחר העלאתם. היומנים לא פורסמו.')
-        rows = list(csv.DictReader(io.StringIO(response.content.decode('utf-8-sig'))))
-        if rows != events:
+        return self._export_workbook(state)
+
+    def upload_snapshot(self, state: dict, events: list[dict]) -> None:
+        existing = self._export_workbook(state)
+        before_links = None
+        try:
+            before_links = read_subscription_rows(existing)
+        except ValueError:
+            pass
+        actual = self._upload_workbook(state, update_workbook(existing, events=events))
+        if read_snapshot(actual) != events:
             raise RuntimeError('השיבוצים שנקראו מ-Google אינם זהים לתצוגה המקדימה. היומנים לא פורסמו.')
+        if before_links is not None and read_subscription_rows(actual) != before_links:
+            raise RuntimeError('גיליון הקישורים לא נשמר לאחר העדכון. היומנים לא פורסמו.')
+
+    def sync_subscription_links(self, state: dict) -> None:
+        existing = self._export_workbook(state)
+        before_events = read_snapshot(existing)
+        actual = self._upload_workbook(state, update_workbook(existing, feeds=state['feeds']))
+        if read_subscription_rows(actual) != subscription_rows(state['feeds']):
+            raise RuntimeError('קישורי המינוי שנקראו מ-Google אינם זהים לקישורים שפורסמו.')
+        if read_snapshot(actual) != before_events:
+            raise RuntimeError('נתוני השיבוצים השתנו בעת עדכון גיליון הקישורים.')
 
     def deploy(self, state: dict, payload: dict[str, str]) -> tuple[int, str]:
         source = HANDLER + '\nvar CALENDAR_FEEDS = ' + json.dumps(payload, ensure_ascii=False) + ';\n'
@@ -319,6 +337,21 @@ class CalendarPublisher:
                     message=f'שמות היומנים עודכנו. שעות עודכנו ב-{changed_hours} שיבוצים, ללא שינוי בתאריכים או בעובדים.',
                     test_mode=state.get('test_mode', False), progress=progress)
 
+    def sync_links_sheet(self, progress=lambda text: None) -> str:
+        """Expose existing published links privately, without redeploying feeds."""
+        with self.store.publishing_lock():
+            state = self.store.read()
+            if not state.get('feeds'):
+                raise RuntimeError('לא נמצאו קישורי יומנים שפורסמו.')
+            progress('מעדכן את גיליון קישורי היומנים')
+            cloud = self.cloud_factory()
+            cloud.check_resources(state)
+            cloud.sync_subscription_links(state)
+            state['links_sheet_synced'] = True
+            state['links_sheet_title'] = LINKS_TAB
+            self.store.write(state)
+            return 'https://docs.google.com/spreadsheets/d/' + state['sheet_id'] + '/edit'
+
     def _publish_months(self, state: dict, months: dict, *, month: str, worker_count: int,
                         message: str, test_mode: bool, progress) -> PublishResult:
         if not all(state.get(k) for k in ('sheet_id', 'script_id', 'deployment_id')):
@@ -347,6 +380,14 @@ class CalendarPublisher:
                      timing_policy=dict(POLICY))
         # Persist the actual live deployment before optional anonymous checks.
         self.store.write(state)
+        progress('מעדכן את גיליון קישורי היומנים')
+        try:
+            cloud.sync_subscription_links(state)
+            state['links_sheet_synced'] = True
+            state['links_sheet_title'] = LINKS_TAB
+        except Exception:
+            state['links_sheet_synced'] = False
+            message += '\nהיומנים פורסמו, אך גיליון הקישורים לא עודכן. הקישורים זמינים באפליקציה.'
         progress('בודק את קישורי היומנים')
         try:
             verified = cloud.verify_feeds(state['feeds'], payload, keys)

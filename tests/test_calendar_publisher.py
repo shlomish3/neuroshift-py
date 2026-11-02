@@ -55,6 +55,7 @@ class FakeCloud:
         self.verified = verified
         self.payload = {}
         self.uploaded = []
+        self.synced_feeds = {}
 
     def check_resources(self, state):
         self.calls.append('resources')
@@ -75,6 +76,12 @@ class FakeCloud:
     def verify_feeds(self, feeds, payload, keys):
         self.calls.append('verify')
         return self.verified
+
+    def sync_subscription_links(self, state):
+        self.calls.append('links')
+        if self.fail == 'links':
+            raise RuntimeError('Link table sync failed')
+        self.synced_feeds = dict(state['feeds'])
 
 
 class CalendarPublisherTests(unittest.TestCase):
@@ -178,6 +185,32 @@ class CalendarPublisherTests(unittest.TestCase):
         self.assertFalse(result.changed)
         self.assertEqual(self.cloud.calls, calls)
         self.assertEqual(self.store.read()['version'], version)
+
+    def test_links_tab_sync_does_not_publish_or_change_subscriptions(self):
+        before = self.store.read()
+        url = self.publisher.sync_links_sheet()
+        after = self.store.read()
+        self.assertEqual(url, 'https://docs.google.com/spreadsheets/d/test-sheet/edit')
+        self.assertEqual(self.cloud.calls, ['resources', 'links'])
+        self.assertEqual(after['feeds'], before['feeds'])
+        self.assertEqual(after['worker_keys'], before['worker_keys'])
+        self.assertEqual(after['version'], before['version'])
+        self.assertTrue(after['links_sheet_synced'])
+
+    def test_published_new_workers_appear_in_link_table(self):
+        self.publisher.publish(self.publisher.preview(self.path))
+        state = self.store.read()
+        self.assertEqual(self.cloud.synced_feeds, state['feeds'])
+        self.assertEqual(len(self.cloud.synced_feeds), 3)
+        self.assertTrue(state['links_sheet_synced'])
+
+    def test_link_table_failure_does_not_lose_successful_publication(self):
+        self.cloud.fail = 'links'
+        result = self.publisher.publish(self.publisher.preview(self.path))
+        self.assertTrue(result.changed)
+        self.assertTrue(result.verified)
+        self.assertFalse(self.store.read()['links_sheet_synced'])
+        self.assertIn('גיליון הקישורים לא עודכן', result.message)
 
     def test_changed_source_and_stale_preview_cannot_publish(self):
         preview = self.publisher.preview(self.path)

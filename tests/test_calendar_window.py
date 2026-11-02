@@ -76,6 +76,18 @@ class CalendarWindowTests(unittest.TestCase):
         self.assertIs(self.app._calendar_window, self.window)
         self.assertEqual(self.cloud.calls, [])
 
+    def test_links_sheet_button_syncs_without_preview_or_publication(self):
+        before = self.store.read()
+        self.window.sync_links_button.invoke()
+        self.wait()
+        self.assertFalse(self.errors)
+        self.assertEqual(self.cloud.calls, ['resources', 'links'])
+        self.assertEqual(self.cloud.synced_feeds, before['feeds'])
+        self.assertEqual(self.store.read()['version'], before['version'])
+        self.assertTrue(self.store.read()['links_sheet_synced'])
+        self.assertIsNone(self.window._preview)
+        self.assertIn('גיליון קישורי יומנים עודכן', self.window.status_var.get())
+
     def test_select_preview_filter_and_publish(self):
         self.assertIn('disabled', self.window.publish_button.state())
         self.window._preview_file()

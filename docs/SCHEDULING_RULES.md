@@ -14,6 +14,11 @@ Personal calendar names use exactly `Neuroshift - <worker>` (lowercase s),
 independent of the published month. Preserve existing subscription URLs when
 updating this metadata; Google's client-selected display name still requires
 client verification and may need a manual rename.
+The dedicated private calendars Google Sheet has a **קישורי יומנים** tab with
+worker names, calendar names and permanent subscription URLs. Preserve it on
+future publications and update it only from successfully published links. The
+app's **עדכון גיליון הקישורים** refreshes it without generating a roster or
+redeploying calendar feeds; do not put this directory in the scheduler input Sheet.
 
 Calendar hours confirmed by the user on 2026-11-02 (Asia/Jerusalem): both resident
 night types start at 16:00 Sunday-Thursday, 13:00 Fridays/holiday eves, and 09:00

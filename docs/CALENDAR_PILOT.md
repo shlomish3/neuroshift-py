@@ -11,6 +11,9 @@ No roster generation, source-workbook edits or worker notifications were perform
 - Owner: `shamir.neuroshift@gmail.com`, verified through Google identity and
   owner-only permissions on the new source Sheet.
 - [Private calendar Sheet](https://docs.google.com/spreadsheets/d/1VW_m4Os86AldMCgrK1pYgRAOQv7BxHBlyQPr5Ry_rIQ/edit)
+- **קישורי יומנים** in that Sheet lists all 18 workers, their calendar names and
+  copyable subscription URLs. The app maintains it after successful publishing;
+  **עדכון גיליון הקישורים** also refreshes it without redeploying calendars.
 - [Separate Apps Script project](https://script.google.com/home/projects/1eAN4dbKx3rk7Y9_lCLoySwesoLWwGL0UOUH6_vuR32tABWD5pHBmIBFG/edit)
 - Deployed version 6 serves the same 18 secret personal calendar links, covering 94 actual
   duties. Test labels were removed from names/titles at the user's request. Event
@@ -70,11 +73,13 @@ The new app screen uses `core/calendar_publisher.py` and supports arbitrary mont
 previews and persistent monthly snapshots. Use the app for subsequent publishing;
 the initial CLI is November-only and refuses to run after the GUI's schema migration.
 
-The publisher imports the extracted CSV into a private Sheet, reads it back and
-compares every record, then compiles the verified Sheet snapshot into a versioned
+The app publisher now uses XLSX export/edit/import through Drive to retain the
+links tab and other worksheet cells when updating its assignment table. It reads
+the Sheet back and compares every record, then compiles the verified snapshot into a versioned
 Apps Script deployment. The public serving path needs no Google OAuth scopes or
 live Sheet reads. Sheet edits do not change feeds until an explicit publish.
 Revisions preserve personal URLs and event UIDs and advance event sequence/time.
+The original CLI's CSV replacement is historical; use the app's multi-tab path.
 
 Personal keys, full URLs, extracted CSV/ICS files, source fingerprints and cloud
 resource IDs are in ignored `.calendar-pilot/`. Do not commit them or distribute

@@ -16,6 +16,14 @@ window's header. Restart an already-open app after a code update.
    link. The calendars, links, private source Sheet and script project are
    visible here even before choosing a workbook. Nothing is sent to workers.
 
+The dedicated private calendar Google Sheet also has a **קישורי יומנים** tab:
+worker name, `Neuroshift - <worker>` calendar name and a copyable subscription URL.
+Use this Sheet rather than the scheduler's input Sheet for sharing links. It is
+updated after successful publications, preserving permanent links. The app's
+**עדכון גיליון הקישורים** button refreshes this directory independently, without
+choosing a workbook or publishing calendars. The Sheet remains owner-only;
+copy each worker's individual URL rather than sharing the whole directory.
+
 On 2026-11-02 the user authorized sharing the calendars with workers. Version 4
 removes בדיקה/TEST from calendar names and event titles at the same deployment
 and all 18 existing personal URLs. All 94 duty identities and start/end times are
@@ -56,6 +64,8 @@ Naming references: [RFC 7986 NAME](https://www.rfc-editor.org/rfc/rfc7986.html#s
 - `core/calendar_publisher.py`: persistent monthly snapshots, account/resource
   verification, private Google Sheet upload/readback, explicit Apps Script
   publication, local publication state, anonymous feed checks and process lock.
+- `core/calendar_sheet.py`: assignment and subscription-link tables in the private
+  Sheet, with formatted Hebrew link rows and preservation of other worksheet cells.
 - The workbook is read once into memory and never rewritten or recalculated.
   Required duty headers are recognized by name rather than column position;
   כ.שבץ is optional. Blank duties are shown as warnings and produce no event.
@@ -79,10 +89,13 @@ Naming references: [RFC 7986 NAME](https://www.rfc-editor.org/rfc/rfc7986.html#s
   these are not calendar/event labels. The resource check still verifies the
   original owner-only Sheet and the same resource IDs. Do not rename resources
   without updating that check.
-- The publisher uploads the complete monthly snapshot to the dedicated private
-  Sheet through Drive CSV conversion, checks readback, then publishes an immutable
-  Apps Script version at the same deployment URL. It needs no new API enablement.
-  The serving path has no Google scopes and no live Sheet reads.
+- The publisher exports the private Sheet as XLSX, replaces only its assignment
+  table, imports the workbook back into the same Google Sheet and checks readback.
+  Other tabs, including **קישורי יומנים**, are retained. After successful Apps
+  Script deployment, it updates the links directory from the published state.
+  A directory-update failure is reported separately and can be retried with the
+  app button; it does not undo successful calendar publication. No new API
+  enablement is needed. The serving path has no Google scopes or live Sheet reads.
 - Failure before deployment leaves the local published baseline unchanged; the
   private source Sheet may contain the prepared candidate for a safe retry. After
   successful deployment, local state records the live version before optional
@@ -90,6 +103,15 @@ Naming references: [RFC 7986 NAME](https://www.rfc-editor.org/rfc/rfc7986.html#s
   than incorrectly reporting that no publication occurred.
 
 ## Verification
+
+The links-directory addition passed 166 project unit tests, including workbook
+tab/cell/formula preservation, copyable URLs, repeated sync, new-worker publishing,
+partial cloud failures and the independent app button. The live Sheet was then
+read back: 18 links match the published state exactly, all 94 assignments are
+unchanged, the Sheet remains owner-only, and calendar deployment stays version 6.
+No roster or new calendar deployment was generated for this addition.
+The isolated Git snapshot passed all 119 tests it contains; unrelated local
+scheduler changes and their tests are outside this calendar commit.
 
 155 project unit tests and 15 separate pilot tests passed without running a
 roster. Tests cover real date cells, month rollover, holidays, per-worker feeds,

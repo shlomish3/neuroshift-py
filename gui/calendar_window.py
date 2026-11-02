@@ -97,6 +97,9 @@ class CalendarWindow(tk.Toplevel):
         ttk.Button(resources, text='פתח את גיליון היומנים', command=lambda: self._open_resource('sheet')).pack(side='right', padx=(8, 0))
         ttk.Button(resources, text='פתח את פרויקט היומנים', command=lambda: self._open_resource('script')).pack(side='right', padx=(8, 0))
         ttk.Button(resources, text='הוראות הצטרפות', command=self._instructions).pack(side='right')
+        self.sync_links_button = ttk.Button(resources, text='עדכון גיליון הקישורים',
+            command=lambda: self._start('links_synced', self.publisher.sync_links_sheet, 'מעדכן את גיליון הקישורים…'))
+        self.sync_links_button.pack(side='right', padx=(8, 0))
         self.links_tree = self._table(links_tab, [('count', 'שיבוצים שפורסמו', 160), ('worker', 'עובד/ת', 280)])
         self.links_tree.bind('<<TreeviewSelect>>', self._select_link)
         link_row = ttk.Frame(links_tab)
@@ -175,7 +178,7 @@ class CalendarWindow(tk.Toplevel):
         threading.Thread(target=worker, daemon=True).start()
 
     def _set_controls(self):
-        for widget in (self.browse_button, self.preview_button, self.file_entry):
+        for widget in (self.browse_button, self.preview_button, self.file_entry, self.sync_links_button):
             widget.configure(state='disabled' if self._busy else 'normal')
         self.publish_button.configure(state='normal' if self._preview and not self._busy else 'disabled')
 
@@ -211,6 +214,9 @@ class CalendarWindow(tk.Toplevel):
                 elif kind == 'published':
                     self.status_var.set(value.message)
                     self._preview = None
+                    self._refresh_links()
+                elif kind == 'links_synced':
+                    self.status_var.set('גיליון קישורי יומנים עודכן. אפשר לפתוח את גיליון היומנים ולהעתיק ממנו קישורים.')
                     self._refresh_links()
                 else:
                     self._preview = None
